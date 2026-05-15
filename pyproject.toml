@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auralis"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "librosa>=0.10",
+    "soundfile>=0.12",
+    "scikit-learn>=1.3",
+    "noisereduce>=3.0",
+    "matplotlib>=3.7",
+    "joblib>=1.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "jupyter>=1.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pyrefly]
+python_interpreter = "venv/bin/python"
+search_path = ["."]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

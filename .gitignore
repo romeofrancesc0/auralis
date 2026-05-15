@@ -1,0 +1,22 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.DS_Store
+
+# Dati e modelli (pesanti, rigenerabili)
+data/raw/
+data/processed/
+models/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Variabili d'ambiente
+.env
+
+# File interni — non pubblici su GitHub
+CLAUDE.md
