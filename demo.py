@@ -1,13 +1,13 @@
-"""Quick demo: genera un mix M+F, esegue la pipeline, salva i file da ascoltare.
+"""Quick demo: generates a male/female mix, runs the full pipeline, and saves output files.
 
 Usage:
     python demo.py
 
-Output in data/processed/demo/:
-    - mix.wav         → il mix originale (voce F + voce M)
-    - target.wav      → la voce femminile isolata (ground truth)
-    - interferer.wav  → la voce maschile (ground truth)
-    - output.wav      → output del sistema (voce F estratta dal mix)
+Output files in data/processed/demo/:
+    - mix.wav         → original mixture (female voice + male voice)
+    - target.wav      → isolated female voice (ground truth)
+    - interferer.wav  → male voice (ground truth)
+    - output.wav      → system output (female voice extracted from the mix)
 """
 from __future__ import annotations
 
@@ -28,42 +28,42 @@ OUT_DIR = "data/processed/demo"
 
 
 def main() -> None:
-    log.info("Generando un campione di test da LibriSpeech...")
+    log.info("Generating a test sample from LibriSpeech...")
     samples = make_samples(n_samples=1, clip_duration=5.0, seed=7)
     sample = samples[0]
 
-    log.info("Speaker target (F): %s | Speaker interferente (M): %s",
+    log.info("Target speaker (F): %s | Interferer speaker (M): %s",
              sample.target_speaker_id, sample.interferer_speaker_id)
 
-    # Salva mix e ground truth
+    # Save mix and ground truth
     save_audio(f"{OUT_DIR}/mix.wav", sample.mixture, sr=sample.sr)
     save_audio(f"{OUT_DIR}/target.wav", sample.target, sr=sample.sr)
     save_audio(f"{OUT_DIR}/interferer.wav", sample.interferer, sr=sample.sr)
 
-    # Esegue la pipeline
-    log.info("Caricando il classificatore da %s...", MODEL_PATH)
+    # Run the pipeline
+    log.info("Loading classifier from %s...", MODEL_PATH)
     classifier = SpeakerClassifier.load(MODEL_PATH)
     attention = AttentionModule(classifier)
 
-    log.info("Calcolando la maschera di attenzione...")
+    log.info("Computing attention mask...")
     mask = attention.compute_mask(sample.mixture, sr=sample.sr)
-    log.info("Genere dominante rilevato nel mix: %s", attention.dominant_gender(sample.mixture, sr=sample.sr))
+    log.info("Dominant gender detected in mix: %s", attention.dominant_gender(sample.mixture, sr=sample.sr))
 
-    log.info("Separando con NMF guidata dal classificatore...")
+    log.info("Separating with classifier-guided NMF...")
     reconstructed = separate_nmf(sample.mixture, mask, sr=sample.sr)
     output = enhance(reconstructed, sr=sample.sr)
 
     save_audio(f"{OUT_DIR}/output.wav", output, sr=sample.sr)
 
-    print("\n" + "="*55)
-    print("  FILE SALVATI IN data/processed/demo/")
-    print("="*55)
-    print("  mix.wav         → mix originale (F + M)")
-    print("  target.wav      → voce femminile (ground truth)")
-    print("  interferer.wav  → voce maschile (ground truth)")
-    print("  output.wav      → voce estratta dal sistema")
-    print("="*55)
-    print("\nAscolta i file nell'ordine sopra per valutare il risultato.")
+    print("\n" + "=" * 55)
+    print("  OUTPUT FILES SAVED TO data/processed/demo/")
+    print("=" * 55)
+    print("  mix.wav         → original mixture (F + M)")
+    print("  target.wav      → female voice (ground truth)")
+    print("  interferer.wav  → male voice (ground truth)")
+    print("  output.wav      → system output (extracted female voice)")
+    print("=" * 55)
+    print("\nListen to the files in the order above to evaluate the result.")
 
 
 if __name__ == "__main__":

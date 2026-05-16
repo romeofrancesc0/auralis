@@ -1,111 +1,156 @@
 # Auralis
 
-Un sistema di **attenzione selettiva uditiva** ispirato al *cocktail party problem*: non si limita a separare le voci in una scena multi-speaker, ma sceglie automaticamente *quale* parlante ascoltare, ricostruendone il segnale isolato.
+> **AI-based selective auditory attention system inspired by the cocktail party problem.**
+> Not just source separation — a simulation of the human cognitive mechanism that decides *which* speaker to listen to.
 
 ---
 
-## Il problema
+## The Problem
 
-Quando ci troviamo in un ambiente affollato — una festa, un bar, una sala riunioni — il nostro cervello compie un'operazione straordinaria: riesce a concentrarsi su una singola voce, ignorando il rumore di fondo e le altre conversazioni. Questo fenomeno è noto come **cocktail party problem**, formalizzato da Colin Cherry nel 1953.
+In a crowded room — a party, a café, a meeting — the human brain performs a remarkable feat: it focuses on a single voice while filtering out all others. This is the **cocktail party problem**, first formalised by Colin Cherry in 1953.
 
-I sistemi tradizionali di *source separation* affrontano il problema da una prospettiva puramente algoritmica: separare tutte le sorgenti audio presenti nel segnale. Manca però il passo successivo, quello veramente umano: **decidere a quale voce prestare attenzione**.
+Traditional *source separation* systems approach it algorithmically: separate every audio source present in the signal. But they miss the crucial next step — the one that is truly human: **deciding which voice to pay attention to**.
 
-Questo progetto affronta entrambi i lati del problema:
+Auralis addresses both sides of the problem:
 
-- **Separazione** (DSP) — isolare le componenti acustiche dei diversi parlanti.
-- **Attenzione selettiva** (AI) — scegliere automaticamente il parlante target sulla base delle sue caratteristiche acustiche (pitch, energia, timbro, genere vocale), simulando il meccanismo cognitivo umano.
+- **Separation** (DSP) — isolate the acoustic components of each speaker.
+- **Selective attention** (AI) — automatically select the target speaker based on acoustic features (pitch, energy, timbre, vocal gender), simulating the human auditory attention mechanism.
 
 ---
 
-## Architettura
+## Architecture
 
 ```
                   ┌───────────────────────┐
-   Audio mix ───► │  DSP: feature extract │  (STFT, MFCC, pitch, energia)
+   Audio mix ───► │  DSP: feature extract │  (STFT, MFCC, pitch, energy)
                   └───────────┬───────────┘
                               │ features
                               ▼
                   ┌───────────────────────┐
-                  │  AI: attention module │  (classificatore parlante target)
+                  │  AI: attention module │  (target speaker classifier)
                   └───────────┬───────────┘
-                              │ target speaker ID / mask
+                              │ per-frame attention mask
                               ▼
                   ┌───────────────────────┐
                   │  DSP: separation +    │  (mask application, ISTFT,
                   │  reconstruction       │   speech enhancement)
                   └───────────┬───────────┘
                               ▼
-                       Audio isolato
+                       Isolated audio
 ```
 
-Il sistema è composto da due moduli che lavorano in pipeline:
+---
 
-1. **Modulo DSP** — analizza il segnale audio in ingresso ed estrae le feature acustiche fondamentali.
-2. **Modulo AI** — riceve le feature, classifica i parlanti e seleziona il target di attenzione.
-3. **Modulo DSP (ricostruzione)** — applica una maschera tempo-frequenza al segnale e ricostruisce l'audio del solo parlante target, con speech enhancement post-processing.
+## How It Works
+
+### 1. Pre-processing
+The input audio is loaded, resampled to 16 kHz, and transformed into the time-frequency domain via **Short-Time Fourier Transform (STFT)**.
+
+### 2. Feature Extraction — 44 features per frame
+| Feature group | Count | Description |
+|---|---|---|
+| MFCC | 13 | Timbral envelope |
+| MFCC Δ | 13 | First-order temporal derivative |
+| MFCC ΔΔ | 13 | Second-order temporal derivative |
+| Pitch (F0) | 1 | Female vocal range only: 150–310 Hz via pYIN |
+| RMS energy | 1 | Signal intensity |
+| Spectral centroid | 1 | Timbral brightness |
+| Spectral rolloff | 1 | High-frequency energy distribution |
+| ZCR | 1 | Voiced/unvoiced indicator |
+
+### 3. Attention Module
+A **Random Forest** (100 trees) + StandardScaler is trained on IBM frame-level labels extracted from LibriSpeech mixtures at variable SNR (−3, 0, +3 dB). For every frame of the mixture, it outputs a probability in [0, 1] representing confidence that the frame belongs to the target (female) speaker.
+
+Training on the mixture signal — not on isolated voices — eliminates the train/inference domain mismatch and makes the classifier robust across different mixing conditions.
+
+### 4. NMF-Guided Separation
+The separation module (`nmf_separation.py`) combines two complementary signals:
+
+1. **NMF decomposition** — the magnitude spectrogram is factored into K=8 spectral bases via Non-negative Matrix Factorisation (V ≈ W×H).
+2. **Dominant-frame scoring** — each NMF component k receives a "femaleness" score computed as the mean attention weight over the frames where k is dominant.
+3. **Hybrid IRM** — the final per-bin mask blends 65% attention weights (reliable temporal F/M signal) with 35% NMF soft mask (per-frequency resolution). This prevents IRM collapse when the classifier is uncertain.
+4. **Pitch refinement** — confirmed female harmonic bins are raised to ≥ 0.85 (harmonic floor); confirmed male harmonic bins are suppressed to ≤ 0.08 (male suppression).
+
+### 5. Reconstruction
+The IRM is applied to the complex STFT (preserving the original phase), then **ISTFT** converts back to the time domain. A final **speech enhancement** step (`noisereduce` + peak normalisation) cleans up residual artefacts.
 
 ---
 
-## Requisiti di sistema
+## Requirements
 
 - **Python 3.10+**
-- **Sistema operativo:** Linux, macOS o Windows
-- **RAM:** 4 GB minimi consigliati
+- **OS:** Linux, macOS, or Windows
+- **RAM:** 4 GB recommended
 
-### Dipendenze Python principali
+### Main Python dependencies
 
-- `numpy`, `scipy` — operazioni numeriche e DSP
-- `librosa`, `soundfile` — audio I/O e feature extraction
-- `scikit-learn` — modelli ML leggeri
-- `noisereduce` — speech enhancement
-- `matplotlib` — visualizzazione di spettrogrammi e diagnostica
-- `pytest` — testing
+| Library | Purpose |
+|---|---|
+| `numpy`, `scipy` | Numerical operations and DSP |
+| `librosa`, `soundfile` | Audio I/O and feature extraction |
+| `scikit-learn` | Lightweight ML models |
+| `noisereduce` | Spectral noise reduction |
+| `matplotlib` | Spectrograms and diagnostics |
+| `pytest` | Unit testing |
 
-Vedi `requirements.txt` per l'elenco completo e le versioni.
+See `requirements.txt` for the full list with pinned versions.
 
 ---
 
-## Installazione
+## Installation
 
 ```bash
-# 1. Clona il repository
+# 1. Clone the repository
 git clone <repo-url>
 cd auralis
 
-# 2. Crea e attiva un ambiente virtuale
-python -m venv venv
+# 2. Create and activate a virtual environment
+python3 -m venv venv
 source venv/bin/activate     # macOS / Linux
 # venv\Scripts\activate      # Windows
 
-# 3. Installa le dipendenze
-pip install -r requirements.txt
+# 3. Install dependencies
+pip install -e ".[dev]"
 ```
+
+> **Dataset:** download LibriSpeech `dev-clean` from [openslr.org/12](https://www.openslr.org/12/) and place it under `data/raw/librispeech/dev-clean/`.
 
 ---
 
-## Utilizzo
+## Usage
 
-### Demo rapida
+### Quick demo
 
 ```bash
 python demo.py
 ```
 
-Genera automaticamente un mix da LibriSpeech (voce F + voce M), esegue la pipeline completa e salva 4 file in `data/processed/demo/`: `mix.wav`, `target.wav`, `interferer.wav`, `output.wav`.
+Automatically generates a male/female mixture from LibriSpeech, runs the full pipeline, and saves four files to `data/processed/demo/`:
 
-### Pipeline end-to-end su file esterno
+| File | Description |
+|---|---|
+| `mix.wav` | Original mixture (F + M) |
+| `target.wav` | Female voice — ground truth |
+| `interferer.wav` | Male voice — ground truth |
+| `output.wav` | System output — extracted female voice |
+
+### End-to-end pipeline on an external file
 
 ```bash
 python -m src.pipeline --input mix.wav --model models/classifier.joblib --output out.wav
 ```
 
-### Training del classificatore
+### Train the classifier
 
 ```bash
-python -m src.ai.train --n-samples 400 --snr-db -3.0 0.0 3.0 --clip-duration 4.0 --out models/classifier.joblib
+python -m src.ai.train \
+    --n-samples 400 \
+    --snr-db -3.0 0.0 3.0 \
+    --clip-duration 4.0 \
+    --out models/classifier.joblib
 ```
 
-### Test
+### Run tests
 
 ```bash
 pytest tests/
@@ -113,79 +158,53 @@ pytest tests/
 
 ---
 
-## Struttura del progetto
+## Project Structure
 
 ```
 auralis/
-├── CLAUDE.md                  # Memoria persistente per Claude Code
-├── README.md                  # Questo file
-├── ROADMAP.md                 # Piano d'azione e stato di avanzamento
-├── requirements.txt           # Dipendenze Python
-├── demo.py                    # Script di demo rapida
+├── README.md
+├── ROADMAP.md                 # Development plan and progress tracking
+├── requirements.txt
+├── demo.py                    # Quick demo script
 │
-├── src/                       # Codice sorgente
-│   ├── dsp/                   # Componente DSP
-│   │   ├── stft.py            # STFT / ISTFT
-│   │   ├── features.py        # 44 feature/frame: MFCC+delta+delta², pitch, RMS, ecc.
-│   │   ├── dataset.py         # Caricamento LibriSpeech, mix M+F, IBM labels
-│   │   ├── enhancement.py     # Speech enhancement (noisereduce + peak norm)
-│   │   ├── separation.py      # Masking T-F: ratio mask + pitch mask + male suppression
-│   │   └── nmf_separation.py  # Separazione NMF guidata dal classificatore
-│   ├── ai/                    # Componente AI
+├── src/
+│   ├── dsp/
+│   │   ├── stft.py            # STFT / ISTFT (centralised parameters)
+│   │   ├── features.py        # 44-feature extraction per frame
+│   │   ├── dataset.py         # LibriSpeech loader, M+F mixer, IBM dataset builder
+│   │   ├── enhancement.py     # Speech enhancement: noisereduce + peak normalisation
+│   │   ├── separation.py      # T-F masking utilities (ratio mask, pitch mask)
+│   │   └── nmf_separation.py  # Primary separation module (classifier-guided NMF)
+│   │
+│   ├── ai/
 │   │   ├── classifier.py      # SpeakerClassifier (Random Forest + StandardScaler)
-│   │   ├── attention.py       # AttentionModule: maschera per frame
-│   │   └── train.py           # Training IBM multi-SNR su mix LibriSpeech
-│   ├── pipeline.py            # CLI end-to-end
-│   └── utils.py
+│   │   ├── attention.py       # AttentionModule: per-frame soft mask
+│   │   └── train.py           # Multi-SNR IBM training script
+│   │
+│   ├── pipeline.py            # End-to-end CLI
+│   └── utils.py               # Audio I/O utilities
 │
-├── data/                      # Dati audio (raw/ + processed/)
-├── models/                    # Modelli addestrati
-├── notebooks/                 # Esperimenti e analisi
-├── tests/                     # Test unitari
-└── docs/                      # Documentazione teorica
+├── data/
+│   ├── raw/librispeech/       # LibriSpeech dev-clean (not tracked by git)
+│   └── processed/demo/        # Demo output files
+│
+├── models/                    # Trained classifier (not tracked by git)
+├── notebooks/                 # Experiments and analysis
+├── tests/                     # Unit tests (pytest)
+└── docs/                      # Theoretical documentation
 ```
 
 ---
 
-## Come funziona
+## Theoretical References
 
-### Pipeline AI + DSP
-
-#### 1. Pre-processing (DSP)
-Il segnale audio in ingresso viene caricato, eventualmente ricampionato a una frequenza standard (es. 16 kHz) e segmentato in finestre temporali tramite **Short-Time Fourier Transform (STFT)**. Questo permette di lavorare in dominio tempo-frequenza.
-
-#### 2. Feature extraction (DSP)
-Per ogni finestra temporale vengono estratte 44 feature acustiche:
-- **MFCC + delta + delta²** — timbro e sua evoluzione temporale (39 feature).
-- **Pitch (F0)** — frequenza fondamentale nel range femminile (150–310 Hz) via pYIN.
-- **Energia (RMS)** — intensità del segnale.
-- **Spectral centroid / rolloff** — caratteristiche del colore timbrico.
-- **ZCR** (Zero Crossing Rate) — indicatore della natura voiced/unvoiced.
-
-#### 3. Attention module (AI)
-Le feature vengono date in input a un **Random Forest** (100 alberi) + StandardScaler, addestrato su frame reali di mix a SNR variabile (-3, 0, +3 dB) con etichette IBM frame-level. Per ogni finestra il modello produce una probabilità "femminile" in [0, 1].
-
-#### 4. Separation NMF (DSP)
-La separazione avviene in `nmf_separation.py`:
-1. **NMF**: decompone lo spettrogramma di magnitudine in K=8 componenti (V ≈ W×H).
-2. **Dominant-frame scoring**: ogni componente NMF riceve uno score di "femminilità" basato sulle attention weights nei frame in cui quella componente è dominante.
-3. **IRM ibrida**: l'IRM per bin è la media pesata tra le attention weights del classificatore (65%, segnale temporale affidabile) e la soft mask NMF lineare V_f/(V_f+V_m) (35%, risoluzione in frequenza).
-4. **Pitch refinement**: i bin armonici femminili confermati da pYIN vengono elevati a ≥ 0.85; i bin armonici maschili vengono soppressi a ≤ 0.08.
-
-#### 5. Reconstruction (DSP)
-La maschera IRM viene applicata allo STFT complesso (preservando la fase originale), poi si applica la **ISTFT** per tornare al dominio temporale. Un passo finale di **speech enhancement** (`noisereduce` + peak normalization) rifinisce il segnale ricostruito.
+- **Cherry, E. C.** (1953). *Some Experiments on the Recognition of Speech, with One and with Two Ears.* Journal of the Acoustical Society of America, 25(5), 975–979. — Original definition of the cocktail party problem.
+- **Bregman, A. S.** (1990). *Auditory Scene Analysis: The Perceptual Organization of Sound.* MIT Press. — Theoretical foundation of auditory perception and source segregation.
+- **Wang, D., & Brown, G. J.** (2006). *Computational Auditory Scene Analysis: Principles, Algorithms, and Applications.* Wiley-IEEE Press.
+- **Hyvärinen, A., & Oja, E.** (2000). *Independent Component Analysis: Algorithms and Applications.* Neural Networks, 13(4–5), 411–430.
 
 ---
 
-## Riferimenti teorici
+## License
 
-- **Cherry, E. C.** (1953). *Some Experiments on the Recognition of Speech, with One and with Two Ears*. The Journal of the Acoustical Society of America, 25(5), 975–979. — Definizione originale del *cocktail party problem*.
-- **Bregman, A. S.** (1990). *Auditory Scene Analysis: The Perceptual Organization of Sound*. MIT Press. — Fondamento teorico della percezione uditiva e della segregazione delle sorgenti.
-- **Wang, D., & Brown, G. J.** (2006). *Computational Auditory Scene Analysis: Principles, Algorithms, and Applications*. Wiley-IEEE Press.
-- **Hyvärinen, A., & Oja, E.** (2000). *Independent Component Analysis: Algorithms and Applications*. Neural Networks, 13(4-5), 411–430.
-
----
-
-## Licenza
-
-Da definire.
+To be defined.
