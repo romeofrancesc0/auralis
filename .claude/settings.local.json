@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(venv/bin/python *)"
+      "Bash(venv/bin/python *)",
+      "Bash(venv/bin/pip install *)",
+      "Bash(grep -v \"^$\")"
     ]
   }
 }

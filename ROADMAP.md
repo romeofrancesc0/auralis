@@ -168,7 +168,7 @@ Phases 1 and 2 can proceed in parallel after Phase 0. Phase 3 requires both.
 | 3 | ✅ Done | `src/ai/classifier.py`, `train.py`, `attention.py` — CV on 400 samples × 3 SNR values |
 | 4 | ✅ Done | `src/dsp/nmf_separation.py` (primary module) + `separation.py` (utilities/fallback) |
 | 5 | ✅ Done | `src/dsp/enhancement.py` — noisereduce + peak normalisation |
-| 6 | 🟡 In progress | `src/pipeline.py` + `demo.py` working; automated tests and evaluation notebook pending |
+| 6 | ✅ Done | `src/pipeline.py` + `demo.py` + `tests/test_pipeline.py` (6 tests) + `notebooks/02_evaluation.ipynb` (SI-SDR, PESQ, STOI) |
 
 > Legend: ⬜ Not started · 🟡 In progress · ✅ Done · 🔴 Active bug
 
@@ -202,6 +202,6 @@ After further testing (v2 attenuated both voices in overlapping sections), the f
 
 ## Next Tasks (priority order)
 
-1. **Automated tests** — `tests/test_pipeline.py` (smoke test end-to-end + minimum acceptable SI-SDR)
-2. **Evaluation notebook** — `notebooks/02_evaluation.ipynb` with SI-SDR, PESQ, STOI and before/after spectrograms
-3. **Phase 6 complete** — close with quantitative metrics
+1. ~~**Automated tests** — `tests/test_pipeline.py`~~ ✅ Done (6 tests, 26 total passing)
+2. ~~**Evaluation notebook** — `notebooks/02_evaluation.ipynb`~~ ✅ Done (SI-SDR +3.1 dB, PESQ +0.036, STOI −0.007)
+3. ~~**Phase 6 complete**~~ ✅ Done → next: tag release **v0.1.1**
