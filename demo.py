@@ -12,6 +12,7 @@ Output files in data/processed/demo/:
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from src.ai.attention import AttentionModule
 from src.ai.classifier import SpeakerClassifier
@@ -24,6 +25,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 MODEL_PATH = "models/classifier.joblib"
+GMM_PATH = "models/gender_gmm.joblib"
 OUT_DIR = "data/processed/demo"
 
 
@@ -40,10 +42,20 @@ def main() -> None:
     save_audio(f"{OUT_DIR}/target.wav", sample.target, sr=sample.sr)
     save_audio(f"{OUT_DIR}/interferer.wav", sample.interferer, sr=sample.sr)
 
-    # Run the pipeline
+    # Load classifier
     log.info("Loading classifier from %s...", MODEL_PATH)
     classifier = SpeakerClassifier.load(MODEL_PATH)
-    attention = AttentionModule(classifier)
+
+    # Optionally load GenderGMM
+    gmm = None
+    if Path(GMM_PATH).exists():
+        from src.ai.gmm_classifier import GenderGMM
+        gmm = GenderGMM.load(GMM_PATH)
+        log.info("Loaded GenderGMM from %s (gmm_weight=0.4)", GMM_PATH)
+    else:
+        log.info("No GenderGMM found at %s — running without GMM blend.", GMM_PATH)
+
+    attention = AttentionModule(classifier, gmm=gmm)
 
     log.info("Computing attention mask...")
     mask = attention.compute_mask(sample.mixture, sr=sample.sr)

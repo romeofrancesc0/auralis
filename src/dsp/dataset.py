@@ -122,6 +122,7 @@ def make_ibm_dataset(
     clip_duration: float = 3.0,
     sr: int = SAMPLE_RATE,
     seed: int = 42,
+    window_size: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build a frame-level dataset for IBM (Ideal Binary Mask) training.
 
@@ -129,16 +130,17 @@ def make_ibm_dataset(
     classifier learns to distinguish F-dominant frames from M-dominant ones
     in a real mixed signal — eliminating the train/inference domain mismatch.
 
-    IBM label per frame: 1 if female source energy > male source energy, else 0.
-    This matches LABEL_MAP where F=0... wait, we use F=0, M=1 — so IBM label
-    is 0 (F dominant) or 1 (M dominant), consistent with the existing LABEL_MAP.
+    When window_size > 1, each sample is a concatenation of window_size
+    consecutive feature frames, giving the model temporal context.
+
+    IBM label per frame: 0 = F-dominant, 1 = M-dominant (matches LABEL_MAP).
 
     Returns:
-        X: (n_frames_total, n_features) — features from mixture frames
+        X: (n_frames_total, n_features * window_size)
         y: (n_frames_total,) — 0 = F-dominant frame, 1 = M-dominant frame
     """
-    from src.dsp.features import extract_all
-    from src.dsp.stft import N_FFT, HOP_LENGTH, compute_stft
+    from src.dsp.features import apply_window, extract_all
+    from src.dsp.stft import compute_stft
 
     samples = make_samples(
         n_samples=n_samples, subset=subset, root=root,
@@ -149,31 +151,30 @@ def make_ibm_dataset(
     y_list: list[np.ndarray] = []
 
     for sample in samples:
-        # Feature matrix from the MIXTURE (n_features, n_frames)
-        mix_features = extract_all(sample.mixture, sr=sr)
+        # Feature matrix from the MIXTURE: (n_features, n_frames)
+        feat = extract_all(sample.mixture, sr=sr)
 
-        # Compute per-frame energy for each isolated source via STFT magnitude
-        stft_f = compute_stft(sample.target)       # (n_freqs, n_frames_stft)
+        # Per-frame energy for each isolated source
+        stft_f = compute_stft(sample.target)
         stft_m = compute_stft(sample.interferer)
-
-        energy_f = (np.abs(stft_f) ** 2).mean(axis=0)   # (n_frames_stft,)
+        energy_f = (np.abs(stft_f) ** 2).mean(axis=0)
         energy_m = (np.abs(stft_m) ** 2).mean(axis=0)
 
-        # Align lengths (feature extractor and STFT may differ by 1-2 frames)
-        n_frames = min(mix_features.shape[1], len(energy_f), len(energy_m))
-        mix_features = mix_features[:, :n_frames]
+        # Align lengths across feature extractor and STFT
+        n_frames = min(feat.shape[1], len(energy_f), len(energy_m))
+        feat = feat[:, :n_frames]
         energy_f = energy_f[:n_frames]
         energy_m = energy_m[:n_frames]
 
-        # IBM label: 0 = F dominant (our target), 1 = M dominant
+        # IBM label: 0 = F-dominant, 1 = M-dominant
         ibm_labels = (energy_f <= energy_m).astype(int)
 
-        X_list.append(mix_features.T)       # (n_frames, n_features)
-        y_list.append(ibm_labels)           # (n_frames,)
+        # Apply sliding window if requested
+        X_frames = apply_window(feat, window_size) if window_size > 1 else feat.T
+        X_list.append(X_frames)    # (n_frames, n_features * window_size)
+        y_list.append(ibm_labels)
 
-    X = np.vstack(X_list)
-    y = np.concatenate(y_list)
-    return X, y
+    return np.vstack(X_list), np.concatenate(y_list)
 
 
 def _load_clip(path: Path, n_samples: int, sr: int) -> np.ndarray:

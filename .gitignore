@@ -20,3 +20,5 @@ models/
 
 # File interni — non pubblici su GitHub
 CLAUDE.md
+TEMP.md
+RELEASE_*.md

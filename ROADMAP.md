@@ -1,7 +1,7 @@
 # ROADMAP — Implementation Plan
 
-> **Status:** in progress — Phases 0–6 complete (end-to-end pipeline working). Missing: evaluation notebook and automated tests with objective metrics.
-> **Last updated:** 2026-05-16.
+> **Status:** in progress — Phases 0–6 complete + post-release improvements (HMM smoothing, GMM likelihood ratio, IRM selective floor). Active issue: STOI −0.069 (intelligibility still below unprocessed mix; next candidate: FastICA pre-separation).
+> **Last updated:** 2026-05-17.
 
 This document tracks the full implementation plan. It must be consulted and updated at the start of each phase. Decisions taken move from the "Open questions" section into the body of the document.
 
@@ -204,4 +204,91 @@ After further testing (v2 attenuated both voices in overlapping sections), the f
 
 1. ~~**Automated tests** — `tests/test_pipeline.py`~~ ✅ Done (6 tests, 26 total passing)
 2. ~~**Evaluation notebook** — `notebooks/02_evaluation.ipynb`~~ ✅ Done (SI-SDR +3.1 dB, PESQ +0.036, STOI −0.007)
-3. ~~**Phase 6 complete**~~ ✅ Done → next: tag release **v0.1.1**
+3. ~~**Phase 6 complete**~~ ✅ Done → released as **v0.1.1**
+
+## Post-release improvements (v0.2.0)
+
+### Diagnosis (2026-05-16)
+Classifier diagnosed as the bottleneck: 56.9% uncertain frames, IBM accuracy 74.6%, recall on F-frames only 67.2%.
+Root cause: no temporal context (single-frame features) + insufficient training data.
+
+### Implemented (2026-05-16)
+- `src/dsp/features.py` — added `apply_window()` and `extract_windowed()` (sliding context window, W=11 frames → 484 features)
+- `src/ai/classifier.py` — replaced Random Forest with MLP (256→128→64), added `window_size` param, updated save/load
+- `src/ai/attention.py` — auto-selects windowed vs flat feature extraction based on `classifier.window_size`
+- `src/dsp/dataset.py` — `make_ibm_dataset()` now accepts `window_size`
+- `src/ai/train.py` — new defaults: 400 samples × 3 SNR values (−3, 0, +3 dB), `--window-size 11`, CV opt-in via `--cv-folds`
+
+### Re-train and evaluate (✅ Done — 2026-05-17)
+Results: uncertain frames 2.7% (was 56.9%), IBM accuracy 67.9%, F-recall 72.0%.
+Root cause shifted to **masking stage** (NMF/IRM). SI-SDR +2.56 dB (PASS), STOI −0.116 (open issue).
+
+### Implemented (2026-05-17) — HMM smoothing + IRM tuning
+- `src/ai/smoothing.py` — new module: `hmm_smooth()`, 2-state HMM forward-backward. Eliminates mask choppiness and biases toward F via asymmetric transitions (p_ff=0.95, p_mf=0.20).
+- `src/ai/attention.py` — `compute_mask()` now accepts `smooth=True` (default); applies HMM smoothing post-classifier.
+- `src/dsp/nmf_separation.py` — IRM tuning:
+  - Blend ratio 65/35 → **75/25** (trust classifier more since it is now reliable)
+  - `female_weights` range [0.15, 0.85] → **[0.05, 0.95]** (M-scored NMF components contribute ~0 to female reconstruction)
+  - Note: IRM_ATTN_SHARPENING removed after testing — it amplified misclassified frames and worsened output.
+
+### Implemented (2026-05-17) — GMM likelihood ratio (solution #2)
+- `src/ai/gmm_classifier.py` — new `GenderGMM` class: two `GaussianMixture` (16 components, diag) trained on CLEAN speech, LLR = log P(X|GMM_F) − log P(X|GMM_M), sigmoid-normalised → P(female) ∈ [0,1].
+- `src/ai/train_gmm.py` — training script: loads clean LibriSpeech clips per gender, extracts 44-dim features, fits GenderGMM, saves to `models/gender_gmm.joblib`.
+- `src/ai/attention.py` — `AttentionModule.__init__()` now accepts optional `gmm` and `gmm_weight=0.4`; `compute_mask()` blends `(1−0.4)*mlp_mask + 0.4*gmm_proba` before HMM smoothing.
+- `src/pipeline.py` — new `--gmm` flag to pass the GMM path at inference.
+- `demo.py` — auto-loads `models/gender_gmm.joblib` if present.
+
+### Implemented (2026-05-17) — IRM selective floor (STOI improvement)
+Diagnosis: after all previous improvements, STOI remained negative (−0.069 from −0.098). Root cause: in male-dominant frames the IRM collapses near zero for bins that still carry female energy (unvoiced consonants, broadband fricatives), creating spectral holes that hurt short-time intelligibility.
+
+- `src/dsp/nmf_separation.py` — added `IRM_FLOOR = 0.15`: a selective floor applied after all masking steps.
+  - Applied only to bins NOT subject to explicit male harmonic suppression (so `MALE_SUPPRESSION = 0.08` is preserved for confirmed male harmonics).
+  - Gated on `attention_weights.mean() >= 0.25`: skipped when the classifier is almost certain everything is male, to avoid adding male leakage in degenerate cases.
+  - Effect: STOI −0.098 → −0.069 (+0.029), PESQ +0.006 → +0.030, SI-SDR +2.540 → +2.680 dB.
+
+**Note — priority fix tested and reverted:** an additional change (female harmonic bins override male suppression) was tested but caused pYIN to amplify wrongly-detected F0 bins in edge cases (e.g., synthetic sine mixtures where pYIN picks a spurious F0). Reverted to preserve test suite stability and safety margin.
+
+**Current metrics (2026-05-17, all 26 tests passing):**
+
+| Metric | Baseline (mix) | System | Δ |
+|---|---|---|---|
+| SI-SDR (dB) | 0.020 | 2.700 | **+2.680** |
+| PESQ | 1.092 | 1.122 | **+0.030** |
+| STOI | 0.612 | 0.543 | −0.069 ⚠️ |
+
+---
+
+## Candidate Solutions to Validate (classifier bottleneck)
+
+The following approaches were identified as potential fixes for the classifier bottleneck (74.6% IBM accuracy, 56.9% uncertain frames, 67.2% F-recall). Each must be evaluated for actual impact before integration.
+
+| # | Method | Target problem | Library | Status |
+|---|---|---|---|---|
+| 1 | HMM smoothing | Uncertain frames / temporal incoherence | `hmmlearn` | ✅ Done |
+| 2 | GMM likelihood ratio | Weak M/F discrimination | `sklearn.mixture` | ✅ Done |
+| 3 | FastICA pre-separation | Noisy features fed to classifier | `sklearn.decomposition` | ⬜ Not started |
+
+### 1 — HMM Smoothing on classifier output
+
+A 2-state HMM (F-dominant / M-dominant) models frame transitions and resolves ambiguous frames via Viterbi decoding. The classifier's per-frame probabilities become HMM emission probabilities; the Viterbi path replaces the raw frame-level decisions.
+
+- **Why it helps:** uncertain frames are resolved by temporal context, not by the single-frame probability alone.
+- **Integration point:** post-processing layer on top of `AttentionModule.compute_mask()` output, no change to existing architecture.
+- **To validate:** does the Viterbi path reduce the uncertain-frame rate below 56.9%? Does SI-SDR improve?
+
+### 2 — GMM Likelihood Ratio for gender modeling
+
+Train two GMMs (`GaussianMixture`) on clean male and female speech features separately. At inference, compute the log-likelihood ratio `log P(frame|GMM_F) - log P(frame|GMM_M)` and use it as an additional feature or as a second-opinion decision criterion alongside the MLP.
+
+- **Why it helps:** GMMs capture the global timbral distribution of each gender, not just single-frame snapshots. Complementary to the MLP.
+- **Integration point:** `src/ai/classifier.py` or as a standalone `GenderGMM` module feeding into `attention.py`.
+- **To validate:** does adding the LLR feature improve IBM accuracy above 74.6%? Does F-recall exceed 67.2%?
+
+### 3 — FastICA pre-separation
+
+Apply `FastICA` before feature extraction to decompose the mixture into statistically independent components. Feed the ICA-separated components to the classifier instead of (or alongside) the raw mix.
+
+- **Why it helps:** gives the classifier cleaner input features with less cross-speaker contamination.
+- **Limitation:** most effective with stereo input (2 channels → 2 sources mathematically guaranteed). Usefulness on mono must be verified experimentally.
+- **Integration point:** `src/dsp/features.py` or as a pre-step in `src/pipeline.py`.
+- **To validate:** does ICA pre-processing reduce feature noise? Does it help on mono or only on stereo?

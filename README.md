@@ -59,17 +59,21 @@ The input audio is loaded, resampled to 16 kHz, and transformed into the time-fr
 | ZCR | 1 | Voiced/unvoiced indicator |
 
 ### 3. Attention Module
-A **Random Forest** (100 trees) + StandardScaler is trained on IBM frame-level labels extracted from LibriSpeech mixtures at variable SNR (−3, 0, +3 dB). For every frame of the mixture, it outputs a probability in [0, 1] representing confidence that the frame belongs to the target (female) speaker.
+The attention module combines two complementary models:
 
-Training on the mixture signal — not on isolated voices — eliminates the train/inference domain mismatch and makes the classifier robust across different mixing conditions.
+- **MLP classifier** (256 → 128 → 64, ReLU, early stopping) + StandardScaler trained on IBM frame-level labels from LibriSpeech mixtures at variable SNR (−3, 0, +3 dB). Each sample is a sliding window of 11 consecutive frames (484 features total), giving the model temporal context. Training on mixture frames — not isolated voices — eliminates the train/inference domain mismatch.
+- **GenderGMM** — two Gaussian Mixture Models (16 components, diagonal covariance) trained on clean (non-mixed) LibriSpeech speech, one per gender. At inference, the log-likelihood ratio `log P(X|GMM_F) − log P(X|GMM_M)` is sigmoid-normalised to P(female) ∈ [0, 1]. Complementary to the MLP: captures the marginal acoustic distribution of each gender rather than the discriminative boundary on mixture frames.
+
+The final per-frame mask blends both signals: `0.6 × MLP + 0.4 × GMM`. A 2-state **HMM** (F-dominant / M-dominant) then applies forward-backward smoothing with asymmetric transition probabilities (p_ff=0.95, p_mf=0.20), absorbing short male interruptions (< ~40 ms) and eliminating choppy mask artefacts.
 
 ### 4. NMF-Guided Separation
 The separation module (`nmf_separation.py`) combines two complementary signals:
 
 1. **NMF decomposition** — the magnitude spectrogram is factored into K=8 spectral bases via Non-negative Matrix Factorisation (V ≈ W×H).
 2. **Dominant-frame scoring** — each NMF component k receives a "femaleness" score computed as the mean attention weight over the frames where k is dominant.
-3. **Hybrid IRM** — the final per-bin mask blends 65% attention weights (reliable temporal F/M signal) with 35% NMF soft mask (per-frequency resolution). This prevents IRM collapse when the classifier is uncertain.
+3. **Hybrid IRM** — the final per-bin mask blends 75% attention weights (reliable temporal F/M signal) with 25% NMF soft mask (per-frequency resolution). This prevents IRM collapse when the classifier is uncertain.
 4. **Pitch refinement** — confirmed female harmonic bins are raised to ≥ 0.85 (harmonic floor); confirmed male harmonic bins are suppressed to ≤ 0.08 (male suppression).
+5. **IRM selective floor** — a global floor of 0.15 is applied after pitch refinement, only to bins not subject to explicit male harmonic suppression and only when the mean attention weight ≥ 0.25. Prevents spectral holes in male-dominant frames that degrade short-time intelligibility.
 
 ### 5. Reconstruction
 The IRM is applied to the complex STFT (preserving the original phase), then **ISTFT** converts back to the time domain. A final **speech enhancement** step (`noisereduce` + peak normalisation) cleans up residual artefacts.
@@ -140,14 +144,23 @@ Automatically generates a male/female mixture from LibriSpeech, runs the full pi
 python -m src.pipeline --input mix.wav --model models/classifier.joblib --output out.wav
 ```
 
-### Train the classifier
+### Train the models
 
 ```bash
-python -m src.ai.train \
-    --n-samples 400 \
-    --snr-db -3.0 0.0 3.0 \
-    --clip-duration 4.0 \
-    --out models/classifier.joblib
+# MLP classifier — IBM multi-SNR training (~10-20 min):
+python -m src.ai.train --out models/classifier.joblib
+
+# With cross-validation (~1-1.5 h):
+python -m src.ai.train --cv-folds 5 --out models/classifier.joblib
+
+# GenderGMM — trained on clean LibriSpeech clips (~1 min):
+python -m src.ai.train_gmm --out models/gender_gmm.joblib
+```
+
+### End-to-end pipeline with GMM blend
+
+```bash
+python -m src.pipeline --input mix.wav --model models/classifier.joblib --gmm models/gender_gmm.joblib --output out.wav
 ```
 
 ### Run tests
@@ -177,9 +190,12 @@ auralis/
 │   │   └── nmf_separation.py  # Primary separation module (classifier-guided NMF)
 │   │
 │   ├── ai/
-│   │   ├── classifier.py      # SpeakerClassifier (Random Forest + StandardScaler)
-│   │   ├── attention.py       # AttentionModule: per-frame soft mask
-│   │   └── train.py           # Multi-SNR IBM training script
+│   │   ├── classifier.py      # SpeakerClassifier (MLP + StandardScaler)
+│   │   ├── attention.py       # AttentionModule: MLP+GMM blend + HMM smoothing
+│   │   ├── smoothing.py       # hmm_smooth(): 2-state forward-backward HMM
+│   │   ├── gmm_classifier.py  # GenderGMM: LLR = log P(X|GMM_F) - log P(X|GMM_M)
+│   │   ├── train.py           # Multi-SNR IBM training script
+│   │   └── train_gmm.py       # GenderGMM training script
 │   │
 │   ├── pipeline.py            # End-to-end CLI
 │   └── utils.py               # Audio I/O utilities
@@ -188,9 +204,14 @@ auralis/
 │   ├── raw/librispeech/       # LibriSpeech dev-clean (not tracked by git)
 │   └── processed/demo/        # Demo output files
 │
-├── models/                    # Trained classifier (not tracked by git)
-├── notebooks/                 # Experiments and analysis
-├── tests/                     # Unit tests (pytest)
+├── models/                    # Trained models (not tracked by git)
+├── notebooks/
+│   ├── 02_evaluation.ipynb    # Quantitative metrics: SI-SDR, PESQ, STOI
+│   └── 03_diagnosis.ipynb     # Classifier vs masking stage diagnosis
+├── tests/
+│   ├── test_utils.py
+│   ├── test_features.py
+│   └── test_pipeline.py       # End-to-end integration tests (26 tests)
 └── docs/                      # Theoretical documentation
 ```
 

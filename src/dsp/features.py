@@ -13,6 +13,7 @@ PITCH_FMIN = 150.0
 PITCH_FMAX = 310.0
 
 N_FEATURES = 44  # 13 MFCC + 13 delta + 13 delta² + pitch + rms + centroid + rolloff + ZCR
+WINDOW_SIZE = 11  # default sliding-window width for contextual feature extraction
 
 
 def extract_mfcc(
@@ -124,3 +125,39 @@ def extract_all(audio: np.ndarray, sr: int = SAMPLE_RATE) -> np.ndarray:
         spectral[:, :n_frames],
         zcr[:, :n_frames],
     ])
+
+
+def apply_window(features: np.ndarray, window_size: int = WINDOW_SIZE) -> np.ndarray:
+    """Apply a sliding context window to a feature matrix.
+
+    Args:
+        features: (N_FEATURES, n_frames) — per-frame feature matrix.
+        window_size: number of consecutive frames to concatenate per sample.
+            Must be odd so the window is symmetric around the centre frame.
+
+    Returns:
+        (n_frames, N_FEATURES * window_size) — one row per frame, each row
+        contains the flattened features of the surrounding window.
+        Edge frames are replicated (not zero-padded) to avoid boundary artefacts.
+    """
+    n_features, n_frames = features.shape
+    half = window_size // 2
+    padded = np.concatenate([
+        np.repeat(features[:, :1], half, axis=1),
+        features,
+        np.repeat(features[:, -1:], half, axis=1),
+    ], axis=1)  # (n_features, n_frames + window_size - 1)
+    return np.stack([padded[:, t:t + window_size].ravel() for t in range(n_frames)])
+
+
+def extract_windowed(
+    audio: np.ndarray,
+    sr: int = SAMPLE_RATE,
+    window_size: int = WINDOW_SIZE,
+) -> np.ndarray:
+    """Extract per-frame features and apply a sliding context window.
+
+    Returns:
+        (n_frames, N_FEATURES * window_size)
+    """
+    return apply_window(extract_all(audio, sr=sr), window_size)

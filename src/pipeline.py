@@ -2,6 +2,8 @@
 
 Usage:
     python -m src.pipeline --input mix.wav --model models/classifier.joblib --output out.wav
+    python -m src.pipeline --input mix.wav --model models/classifier.joblib \
+        --gmm models/gender_gmm.joblib --output out.wav
 """
 from __future__ import annotations
 
@@ -17,13 +19,26 @@ from src.utils import SAMPLE_RATE, load_audio, save_audio
 logger = logging.getLogger(__name__)
 
 
-def run(input_path: str, model_path: str, output_path: str, sr: int = SAMPLE_RATE) -> None:
+def run(
+    input_path: str,
+    model_path: str,
+    output_path: str,
+    gmm_path: str | None = None,
+    sr: int = SAMPLE_RATE,
+) -> None:
     logger.info("Loading audio: %s", input_path)
     audio, sr = load_audio(input_path, sr=sr)
 
     logger.info("Loading classifier: %s", model_path)
     classifier = SpeakerClassifier.load(model_path)
-    attention = AttentionModule(classifier)
+
+    gmm = None
+    if gmm_path:
+        from src.ai.gmm_classifier import GenderGMM
+        logger.info("Loading GenderGMM: %s", gmm_path)
+        gmm = GenderGMM.load(gmm_path)
+
+    attention = AttentionModule(classifier, gmm=gmm)
 
     logger.info("Computing attention mask...")
     mask = attention.compute_mask(audio, sr=sr)
@@ -45,11 +60,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Cocktail party attention: isolate target speaker from mix.")
     parser.add_argument("--input", required=True, help="Path to input mixture WAV file.")
     parser.add_argument("--model", required=True, help="Path to trained classifier (.joblib).")
+    parser.add_argument("--gmm", default=None, help="Path to trained GenderGMM (.joblib). Optional.")
     parser.add_argument("--output", required=True, help="Path for the output WAV file.")
     parser.add_argument("--sr", type=int, default=SAMPLE_RATE, help="Sample rate (default 16000).")
     args = parser.parse_args()
 
-    run(input_path=args.input, model_path=args.model, output_path=args.output, sr=args.sr)
+    run(
+        input_path=args.input,
+        model_path=args.model,
+        output_path=args.output,
+        gmm_path=args.gmm,
+        sr=args.sr,
+    )
 
 
 if __name__ == "__main__":

@@ -26,8 +26,11 @@ from src.dsp.separation import (
 from src.dsp.stft import HOP_LENGTH, N_FFT, compute_istft, compute_stft
 from src.utils import SAMPLE_RATE
 
-N_COMPONENTS = 8    # NMF components — with 2 speakers, beyond 8 mixed components emerge
-NMF_MAX_ITER = 500  # with dominant-frame scores clustering near 0.5
+N_COMPONENTS = 8        # NMF components — with 2 speakers, beyond 8 mixed components emerge
+NMF_MAX_ITER = 500
+IRM_ATTN_BLEND = 0.75   # weight of attention mask in the hybrid IRM
+IRM_NMF_BLEND = 0.25    # weight of NMF soft mask; must sum to 1 with IRM_ATTN_BLEND
+IRM_FLOOR = 0.15        # global minimum IRM: prevents spectral holes that hurt intelligibility
 
 
 def _score_components(H: np.ndarray, attention_weights: np.ndarray) -> np.ndarray:
@@ -145,10 +148,10 @@ def separate_nmf(
     # Step 2 — score components against the attention weights             #
     # ------------------------------------------------------------------ #
     raw_scores = _score_components(H, attention_weights)              # (K,) in [0,1]
-    # Map weights to [0.15, 0.85]: clearly-F → 0.85, clearly-M → 0.15,
-    # uncertain → 0.50. Prevents the IRM from collapsing to 0 when male
-    # components carry more energy than female ones.
-    female_weights = 0.15 + 0.70 * sharpen_mask(raw_scores, power=component_sharpening)
+    # Map weights to [0.05, 0.95]: clearly-F → 0.95, clearly-M → 0.05.
+    # Narrower dead-zone than before (was [0.15, 0.85]) so that male-scored
+    # NMF components contribute almost nothing to the female reconstruction.
+    female_weights = 0.05 + 0.90 * sharpen_mask(raw_scores, power=component_sharpening)
 
     # ------------------------------------------------------------------ #
     # Step 3 — per-bin IRM from NMF reconstructions                      #
@@ -182,9 +185,9 @@ def separate_nmf(
         (0, n_frames - n_frames_attn),
         constant_values=0.5,
     )
-    attn_mask = attn_col[np.newaxis, :]      # (1, n_frames) → broadcasts to (n_freqs, n_frames)
+    attn_mask = attn_col[np.newaxis, :]        # (1, n_frames) → broadcasts
 
-    irm = 0.65 * attn_mask + 0.35 * irm_nmf
+    irm = IRM_ATTN_BLEND * attn_mask + IRM_NMF_BLEND * irm_nmf
     irm = np.clip(irm, 0.0, 1.0).astype(np.float32)
     logger.debug("IRM pre-pitch: mean=%.3f  >0.6: %d%%  <0.4: %d%%",
                  irm.mean(),
@@ -196,6 +199,8 @@ def separate_nmf(
     # Confirmed female harmonics are preserved (floor).                   #
     # Confirmed male harmonics are suppressed (cap).                      #
     # ------------------------------------------------------------------ #
+    male_suppressed_bins = np.zeros(irm.shape, dtype=bool)  # tracks explicit suppressions
+
     if refine_with_pitch:
         _, harmonic_bins = compute_pitch_mask(
             audio, sr=sr, n_fft=N_FFT, hop_length=HOP_LENGTH,
@@ -208,9 +213,24 @@ def separate_nmf(
         )
         male_harmonic_bins = male_mask[:, :n_frames] < 0.5
         irm = np.where(male_harmonic_bins, np.minimum(irm, MALE_SUPPRESSION), irm)
+        male_suppressed_bins = male_harmonic_bins
 
     # ------------------------------------------------------------------ #
-    # Step 5 — apply mask and reconstruct                                 #
+    # Step 5 — global IRM floor (selective)                               #
+    # In male-dominant frames, the IRM can fall near zero for bins that   #
+    # carry female energy (unvoiced speech, broadband fricatives). A floor #
+    # of IRM_FLOOR ensures those bins pass some signal through, preserving #
+    # short-time intelligibility (STOI).                                  #
+    #                                                                     #
+    # Guard: skip when the classifier is almost certain everything is     #
+    # male (mean mask < 0.25). In that regime the female voice is absent  #
+    # or inaudible and the floor would only add male leakage.             #
+    # ------------------------------------------------------------------ #
+    if float(attention_weights.mean()) >= 0.25:
+        irm = np.where(~male_suppressed_bins, np.maximum(irm, IRM_FLOOR), irm)
+
+    # ------------------------------------------------------------------ #
+    # Step 6 — apply mask and reconstruct                                 #
     # Original phase is preserved: masked = |X| * IRM * e^{jφ}           #
     # ------------------------------------------------------------------ #
     masked_stft = stft[:, :n_frames] * irm
