@@ -3,8 +3,10 @@ import pytest
 
 from src.dsp.features import (
     N_FEATURES,
+    N_LPC,
     N_MFCC,
     extract_all,
+    extract_lpc,
     extract_mfcc,
     extract_mfcc_delta,
     extract_pitch,
@@ -112,12 +114,42 @@ def test_zcr_silence_near_zero():
     assert np.all(zcr < 1e-6)
 
 
+# --- LPC ---
+
+def test_lpc_shape():
+    audio = _sine(440.0)
+    lpc = extract_lpc(audio)
+    assert lpc.shape[0] == N_LPC
+    assert lpc.shape[1] > 0
+
+
+def test_lpc_no_nan():
+    audio = _sine(440.0)
+    lpc = extract_lpc(audio)
+    assert not np.any(np.isnan(lpc))
+
+
+def test_lpc_silence_no_nan():
+    audio = _silence()
+    lpc = extract_lpc(audio)
+    assert not np.any(np.isnan(lpc))
+
+
+def test_lpc_short_audio_returns_empty():
+    """Audio shorter than the analysis frame yields zero columns."""
+    short = np.zeros(64, dtype=np.float32)
+    lpc = extract_lpc(short)
+    assert lpc.shape[0] == N_LPC
+    assert lpc.shape[1] == 0
+
+
 # --- extract_all ---
 
 def test_extract_all_shape():
     audio = _sine(440.0)
     features = extract_all(audio)
-    assert features.shape[0] == N_FEATURES  # 13 MFCC + 13Δ + 13Δ² + pitch + rms + centroid + rolloff + ZCR
+    # 13 MFCC + 13Δ + 13Δ² + pitch + rms + centroid + rolloff + ZCR + 12 LPC
+    assert features.shape[0] == N_FEATURES
     assert features.shape[1] > 0
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import librosa
 import numpy as np
 
-from src.dsp.stft import HOP_LENGTH
+from src.dsp.stft import HOP_LENGTH, N_FFT
 from src.utils import SAMPLE_RATE
 
 N_MFCC = 13
@@ -11,8 +11,9 @@ N_MFCC = 13
 # F-dominant frames: F0 detected (150-310 Hz); M-dominant frames: pyin returns NaN → 0.
 PITCH_FMIN = 150.0
 PITCH_FMAX = 310.0
+N_LPC = 12  # LPC filter order — models the vocal tract as a 12th-order all-pole filter
 
-N_FEATURES = 44  # 13 MFCC + 13 delta + 13 delta² + pitch + rms + centroid + rolloff + ZCR
+N_FEATURES = 56  # 13 MFCC + 13 delta + 13 delta² + pitch + rms + centroid + rolloff + ZCR + 12 LPC
 WINDOW_SIZE = 11  # default sliding-window width for contextual feature extraction
 
 
@@ -92,6 +93,36 @@ def extract_zcr(
     return librosa.feature.zero_crossing_rate(y=audio, hop_length=hop_length)
 
 
+def extract_lpc(
+    audio: np.ndarray,
+    hop_length: int = HOP_LENGTH,
+    order: int = N_LPC,
+) -> np.ndarray:
+    """Return LPC coefficients per frame, shape (order, n_frames).
+
+    LPC models the vocal tract as an all-pole filter of the given order.
+    The coefficients complement MFCC by capturing formant structure via the
+    autocorrelation method (Levinson-Durbin recursion) rather than the cepstrum.
+    Each frame is windowed with a Hann window before LPC estimation.
+
+    Returns zeros for audio shorter than the analysis frame (N_FFT samples).
+    """
+    if len(audio) < N_FFT:
+        return np.zeros((order, 0))
+
+    frames = librosa.util.frame(audio, frame_length=N_FFT, hop_length=hop_length)
+    # frames: (N_FFT, n_frames)
+    window = np.hanning(N_FFT)
+    coeffs = np.array([
+        np.nan_to_num(
+            librosa.lpc(frm * window, order=order)[1:],  # drop a[0] = 1
+            nan=0.0, posinf=0.0, neginf=0.0,
+        )
+        for frm in frames.T
+    ])  # (n_frames, order)
+    return coeffs.T  # (order, n_frames)
+
+
 def extract_all(audio: np.ndarray, sr: int = SAMPLE_RATE) -> np.ndarray:
     """Extract and concatenate all features, shape (N_FEATURES, n_frames).
 
@@ -104,18 +135,21 @@ def extract_all(audio: np.ndarray, sr: int = SAMPLE_RATE) -> np.ndarray:
         [41]     Spectral centroid
         [42]     Spectral rolloff
         [43]     Zero crossing rate
+        [44:56]  LPC coefficients (order 12)
     """
-    mfcc = extract_mfcc(audio, sr)           # (13, n_frames)
+    mfcc = extract_mfcc(audio, sr)              # (13, n_frames)
     mfcc_delta = extract_mfcc_delta(audio, sr)  # (26, n_frames)
-    pitch = extract_pitch(audio, sr)          # (1,  n_frames)
-    rms = extract_rms(audio)                 # (1,  n_frames)
-    spectral = extract_spectral(audio, sr)    # (2,  n_frames)
-    zcr = extract_zcr(audio)                 # (1,  n_frames)
+    pitch = extract_pitch(audio, sr)            # (1,  n_frames)
+    rms = extract_rms(audio)                    # (1,  n_frames)
+    spectral = extract_spectral(audio, sr)      # (2,  n_frames)
+    zcr = extract_zcr(audio)                    # (1,  n_frames)
+    lpc = extract_lpc(audio)                    # (12, n_frames)
 
     n_frames = min(
         mfcc.shape[1], mfcc_delta.shape[1],
         pitch.shape[1], rms.shape[1],
         spectral.shape[1], zcr.shape[1],
+        lpc.shape[1],
     )
     return np.vstack([
         mfcc[:, :n_frames],
@@ -124,6 +158,7 @@ def extract_all(audio: np.ndarray, sr: int = SAMPLE_RATE) -> np.ndarray:
         rms[:, :n_frames],
         spectral[:, :n_frames],
         zcr[:, :n_frames],
+        lpc[:, :n_frames],
     ])
 
 
