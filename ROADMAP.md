@@ -1,7 +1,7 @@
 # ROADMAP — Implementation Plan
 
-> **Status:** in progress — Phases 0–6 complete. MaskNet CNN implemented (second-stage AI layer, ~75K params). LPC features (order 12) and log-MMSE enhancement implemented. MaskNet not yet trained or evaluated — next GPU session priority.
-> **Last updated:** 2026-05-20.
+> **Status:** in progress — Phases 0–6 complete. MaskNet CNN trained and evaluated: +3.9 dB SI-SDR over baseline, improvement confirmed aurally. v0.2.0 ready to tag. Open item: baseline regression investigation (pipeline without MaskNet).
+> **Last updated:** 2026-05-22.
 
 This document tracks the full implementation plan. It must be consulted and updated at the start of each phase. Decisions taken move from the "Open questions" section into the body of the document.
 
@@ -208,17 +208,24 @@ After further testing (v2 attenuated both voices in overlapping sections), the f
 4. ~~**MaskNet CNN** — code implemented~~ ✅ Done (2026-05-19)
 5. ~~**LPC features (order 12)**~~ ✅ Done (2026-05-19) — `N_FEATURES` 44 → 56, 4 new tests
 6. ~~**Log-MMSE enhancement**~~ ✅ Done (2026-05-19) — replaces `noisereduce`, pure numpy/scipy
+7. ~~**Retrain classifier + GMM**~~ ✅ Done (2026-05-22) — N_FEATURES 44→56
+8. ~~**Train MaskNet**~~ ✅ Done (2026-05-22) — val_loss=0.147, desktop GPU
+9. ~~**Evaluate MaskNet**~~ ✅ Done (2026-05-22) — SI-SDR +3.945 dB, aurally confirmed → **v0.2.0**
 
-### Next session — priority order
+### Completed (2026-05-22)
+
+| # | Task | Result |
+|---|---|---|
+| 1 | **Retrain classifier + GMM** (N_FEATURES 44→56) | ✅ Done — `classifier.joblib`, `gender_gmm.joblib` regenerated |
+| 2 | **Train MaskNet** on desktop GPU (12GB VRAM) | ✅ Done — `mask_net.pt`, best val_loss=0.147 |
+| 3 | **Evaluate MaskNet** vs baseline | ✅ Done — SI-SDR +3.945 dB over baseline, audibly confirmed |
+
+### Next tasks (priority order)
 
 | # | Task | Notes |
 |---|---|---|
-| 1 | **Train MaskNet** on desktop GPU | `python -m src.ai.train_mask_net --classifier models/classifier.joblib --gmm models/gender_gmm.joblib --n-samples 200 --epochs 50 --out models/mask_net.pt` |
-| 2 | **Retrain classifier + GMM** | N_FEATURES changed 44→56 (LPC added): `classifier.joblib` and `gender_gmm.joblib` must be regenerated before MaskNet training |
-| 3 | **Evaluate MaskNet** vs baseline | Update `notebooks/02_evaluation.ipynb` with MaskNet metrics |
-| 4 | **FastICA pre-separation** | Investigate ICA on mono signal as feature pre-processor |
-
-> **Note (2026-05-19):** LPC (task 3) and MMSE-STSA (task 4) implemented — see sections below. Any previously trained `classifier.joblib` / `gender_gmm.joblib` must be retrained because `N_FEATURES` changed from 44 to 56.
+| 1 | **Investigate baseline regression** | Pipeline without MaskNet: −0.228 dB (was +2.680 dB pre-retraining). Root cause unknown — likely GMM calibration or NMF parameter sensitivity after N_FEATURES change. |
+| 2 | **FastICA pre-separation** | Investigate ICA on mono signal as feature pre-processor (sklearn.decomposition) |
 
 ## Post-release improvements (v0.2.0)
 
@@ -307,9 +314,15 @@ Stage 2: train MaskNet            →  models/mask_net.pt
 ```
 
 ### Status
-- ✅ Code implemented and tested (26/26 tests passing)
-- ⬜ MaskNet not yet trained — needs GPU session (12GB VRAM desktop)
-- ⬜ Quantitative evaluation (SI-SDR / PESQ / STOI delta) not yet available
+- ✅ Code implemented and tested (30/30 tests passing)
+- ✅ MaskNet trained — desktop GPU (12GB VRAM), best val_loss=0.147, 200 samples × 50 epochs
+- ✅ Evaluated vs baseline (2026-05-22, 6 samples, SNR=0 dB)
+
+| Metric | Mix (input) | No MaskNet | With MaskNet | MaskNet Δ |
+|---|---|---|---|---|
+| SI-SDR (dB) | −0.068 | −0.228 | **+3.718** | **+3.945** |
+
+> ⚠️ Baseline regression noted: pipeline without MaskNet dropped from +2.680 dB (v0.1 models, N_FEATURES=44) to −0.228 dB (retrained models, N_FEATURES=56). Root cause under investigation.
 
 ---
 

@@ -8,7 +8,9 @@
       "Bash(pytest tests/test_pipeline.py::test_pipeline_si_sdr_above_threshold -v)",
       "Bash(git *)",
       "Bash(python3 -c \"import sys; [print\\(repr\\(l\\)\\) for l in sys.stdin]\")",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(python3 -c \"import sys; print\\(sys.version\\)\")",
+      "Bash(python3 -c \"import torch; print\\('torch:', torch.__version__, '| CUDA:', torch.cuda.is_available\\(\\), '| MPS:', torch.backends.mps.is_available\\(\\)\\)\")"
     ]
   }
 }
