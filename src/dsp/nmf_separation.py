@@ -5,14 +5,21 @@ Each component is then scored as "female" or "male" by correlating its temporal
 activation H[k,:] with the classifier's attention weights (per-frame F probability).
 A per-bin IRM (approximate Ideal Ratio Mask) is built from the NMF reconstructions
 and refined with the existing pitch masks.
+
+The optional MaskNet (src.ai.mask_net) can further refine the IRM using a small CNN
+trained to match the ideal IRM computed from clean sources.
 """
 from __future__ import annotations
 
 import logging
 import warnings
+from typing import TYPE_CHECKING
 
 import numpy as np
 from sklearn.decomposition import NMF
+
+if TYPE_CHECKING:
+    from src.ai.mask_net import MaskNet
 
 logger = logging.getLogger(__name__)
 
@@ -77,115 +84,83 @@ def _score_components(H: np.ndarray, attention_weights: np.ndarray) -> np.ndarra
     return scores
 
 
-def separate_nmf(
-    audio: np.ndarray,
+def _build_irm(
+    stft: np.ndarray,
+    magnitude: np.ndarray,
     attention_weights: np.ndarray,
-    sr: int = SAMPLE_RATE,
-    n_components: int = N_COMPONENTS,
-    component_sharpening: float = 3.0,
-    refine_with_pitch: bool = True,
+    audio: np.ndarray,
+    sr: int,
+    n_components: int,
+    component_sharpening: float,
+    refine_with_pitch: bool,
 ) -> np.ndarray:
-    """Separate the female voice from the mixture using classifier-guided NMF.
+    """Compute the NMF-guided IRM from a pre-computed STFT.
 
-    Full pipeline:
-        1. STFT → magnitude spectrogram V
-        2. NMF: V ≈ W × H  (K spectral bases + K activation sequences)
-        3. Score each component via correlation with the attention weights
-        4. Build a per-bin IRM from the female/male NMF reconstructions
-        5. Refine with pitch mask (harmonic floor + male suppression)
-        6. Apply mask to the complex STFT and reconstruct via ISTFT
+    Implements steps 1–5 of the separation pipeline:
+        1. NMF decomposition of the magnitude spectrogram
+        2. Component scoring via attention weights
+        3. Per-bin IRM from female/male NMF reconstructions
+        4. Hybrid blend: IRM = 0.75 * attention + 0.25 * NMF-IRM
+        5. Pitch mask refinement (harmonic floor + male suppression + IRM floor)
 
     Args:
-        audio:                mixture waveform, shape (n_samples,)
-        attention_weights:    per-frame F probability, shape (n_frames,)
-        sr:                   sample rate
-        n_components:         number of NMF components K
-        component_sharpening: sigmoid steepness applied to component scores
-        refine_with_pitch:    if True, apply harmonic floor + male suppression
+        stft:               complex STFT, shape (n_freqs, n_frames_stft)
+        magnitude:          |stft|, shape (n_freqs, n_frames_stft)
+        attention_weights:  per-frame F probability, shape (n_frames,)
+        audio:              raw waveform — required for pYIN pitch detection
+        sr:                 sample rate
+        n_components:       number of NMF components K
+        component_sharpening: sigmoid steepness for component score mapping
+        refine_with_pitch:  if True, apply harmonic floor + male suppression
 
     Returns:
-        reconstructed waveform, shape (n_samples,)
+        irm: shape (n_freqs, n_frames), values in [0, 1]
     """
-    stft = compute_stft(audio)                    # (n_freqs, n_frames_stft)
     n_freqs, n_frames_stft = stft.shape
-    magnitude = np.abs(stft)                      # V: (n_freqs, n_frames_stft)
 
-    # ------------------------------------------------------------------ #
-    # Step 1 — NMF: V ≈ W × H                                            #
-    # Normalise magnitude for numerical stability (the IRM is a ratio,   #
-    # so scale cancels out). sklearn expects (n_samples, n_features) →   #
-    # transpose before fitting.                                           #
-    # ------------------------------------------------------------------ #
     eps = 1e-8
     scale = magnitude.max() + eps
-    # Floor at eps to avoid exact zeros that cause NMF instability
     magnitude_norm = np.maximum(magnitude / scale, eps)
 
     nmf = NMF(
         n_components=n_components,
         init="random",
-        solver="mu",     # multiplicative updates: stable with sparse matrices, no division by zero
+        solver="mu",
         max_iter=NMF_MAX_ITER,
         random_state=42,
     )
-    # sklearn < 1.4 'mu' solver emits RuntimeWarning on sparse matrices —
-    # it is an internal false positive; the output is numerically correct.
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=RuntimeWarning, module="sklearn")
-        H_sk = nmf.fit_transform(magnitude_norm.T)  # (n_frames_stft, K) — activations
-    W_sk = nmf.components_                           # (K, n_freqs)     — spectral bases
+        H_sk = nmf.fit_transform(magnitude_norm.T)  # (n_frames_stft, K)
+    W_sk = nmf.components_                           # (K, n_freqs)
 
-    # Standard notation: W (n_freqs, K), H (K, n_frames)
     W = np.nan_to_num(W_sk.T.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)
     H = np.nan_to_num(H_sk.T.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)
-    # Per-component normalisation: scale each component to max=1 so W @ H
-    # stays in range and does not overflow.
-    col_max = W.max(axis=0) + eps   # (K,) — column-wise maximum of W
-    W = W / col_max[np.newaxis, :]  # normalised W
-    H = H * col_max[:, np.newaxis]  # compensated H → W@H unchanged, range stable
+    col_max = W.max(axis=0) + eps
+    W = W / col_max[np.newaxis, :]
+    H = H * col_max[:, np.newaxis]
 
-    # ------------------------------------------------------------------ #
-    # Step 2 — score components against the attention weights             #
-    # ------------------------------------------------------------------ #
-    raw_scores = _score_components(H, attention_weights)              # (K,) in [0,1]
-    # Map weights to [0.05, 0.95]: clearly-F → 0.95, clearly-M → 0.05.
-    # Narrower dead-zone than before (was [0.15, 0.85]) so that male-scored
-    # NMF components contribute almost nothing to the female reconstruction.
+    raw_scores = _score_components(H, attention_weights)
     female_weights = 0.05 + 0.90 * sharpen_mask(raw_scores, power=component_sharpening)
 
-    # ------------------------------------------------------------------ #
-    # Step 3 — per-bin IRM from NMF reconstructions                      #
-    # V_female(f,t) = Σ_k  female_weights[k] * W[f,k] * H[k,t]          #
-    # ------------------------------------------------------------------ #
     n_frames = min(H.shape[1], n_frames_stft)
     H = H[:, :n_frames]
 
-    # These matmuls may raise IEEE-754 RuntimeWarning on subnormal values
-    # from some BLAS implementations — false positive, output is correct.
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=RuntimeWarning)
-        V_female = W @ (female_weights[:, np.newaxis] * H)          # (n_freqs, n_frames)
+        V_female = W @ (female_weights[:, np.newaxis] * H)
         V_male   = W @ ((1.0 - female_weights)[:, np.newaxis] * H)
 
     eps = 1e-8
-    # Linear soft mask: avoids energy-imbalance exaggeration from squaring.
-    # IRM(f,t) = weighted-average of female_weights[k] over components,
-    # where the weight of k is W[f,k]*H[k,t] — i.e. how much k contributes
-    # to bin (f,t). Values stay in [female_weights.min(), female_weights.max()].
-    irm_nmf = V_female / (V_female + V_male + eps)          # (n_freqs, n_frames)
+    irm_nmf = V_female / (V_female + V_male + eps)
 
-    # Blend NMF IRM with the per-frame attention weights.
-    # Attention provides a reliable temporal F/M signal; NMF adds per-frequency
-    # resolution. When NMF component scoring collapses (classifier uncertain,
-    # most dominant-frame scores cluster near 0.5), the attention weights prevent
-    # the IRM from being dragged below 0.5 by NMF energy imbalance.
     n_frames_attn = min(len(attention_weights), n_frames)
     attn_col = np.pad(
         attention_weights[:n_frames_attn].astype(np.float32),
         (0, n_frames - n_frames_attn),
         constant_values=0.5,
     )
-    attn_mask = attn_col[np.newaxis, :]        # (1, n_frames) → broadcasts
+    attn_mask = attn_col[np.newaxis, :]
 
     irm = IRM_ATTN_BLEND * attn_mask + IRM_NMF_BLEND * irm_nmf
     irm = np.clip(irm, 0.0, 1.0).astype(np.float32)
@@ -194,12 +169,7 @@ def separate_nmf(
                  int((irm > 0.6).mean() * 100),
                  int((irm < 0.4).mean() * 100))
 
-    # ------------------------------------------------------------------ #
-    # Step 4 — pitch mask refinement                                      #
-    # Confirmed female harmonics are preserved (floor).                   #
-    # Confirmed male harmonics are suppressed (cap).                      #
-    # ------------------------------------------------------------------ #
-    male_suppressed_bins = np.zeros(irm.shape, dtype=bool)  # tracks explicit suppressions
+    male_suppressed_bins = np.zeros(irm.shape, dtype=bool)
 
     if refine_with_pitch:
         _, harmonic_bins = compute_pitch_mask(
@@ -215,23 +185,91 @@ def separate_nmf(
         irm = np.where(male_harmonic_bins, np.minimum(irm, MALE_SUPPRESSION), irm)
         male_suppressed_bins = male_harmonic_bins
 
-    # ------------------------------------------------------------------ #
-    # Step 5 — global IRM floor (selective)                               #
-    # In male-dominant frames, the IRM can fall near zero for bins that   #
-    # carry female energy (unvoiced speech, broadband fricatives). A floor #
-    # of IRM_FLOOR ensures those bins pass some signal through, preserving #
-    # short-time intelligibility (STOI).                                  #
-    #                                                                     #
-    # Guard: skip when the classifier is almost certain everything is     #
-    # male (mean mask < 0.25). In that regime the female voice is absent  #
-    # or inaudible and the floor would only add male leakage.             #
-    # ------------------------------------------------------------------ #
     if float(attention_weights.mean()) >= 0.25:
         irm = np.where(~male_suppressed_bins, np.maximum(irm, IRM_FLOOR), irm)
 
-    # ------------------------------------------------------------------ #
-    # Step 6 — apply mask and reconstruct                                 #
-    # Original phase is preserved: masked = |X| * IRM * e^{jφ}           #
-    # ------------------------------------------------------------------ #
+    return irm
+
+
+def compute_nmf_irm(
+    audio: np.ndarray,
+    attention_weights: np.ndarray,
+    sr: int = SAMPLE_RATE,
+    n_components: int = N_COMPONENTS,
+    component_sharpening: float = 3.0,
+    refine_with_pitch: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute the NMF-guided IRM and the STFT magnitude spectrogram.
+
+    Public entry point used by the MaskNet training script to obtain the
+    classical-pipeline IRM as a training input feature.
+
+    Args:
+        audio:             mixture waveform, shape (n_samples,)
+        attention_weights: per-frame F probability, shape (n_frames,)
+        sr:                sample rate
+        n_components:      number of NMF components K
+        component_sharpening: sigmoid steepness for component scoring
+        refine_with_pitch: if True, apply harmonic floor + male suppression
+
+    Returns:
+        irm:       shape (n_freqs, n_frames), values in [0, 1]
+        magnitude: shape (n_freqs, n_frames)
+    """
+    stft = compute_stft(audio)
+    magnitude = np.abs(stft)
+    irm = _build_irm(
+        stft, magnitude, attention_weights, audio,
+        sr, n_components, component_sharpening, refine_with_pitch,
+    )
+    n_frames = irm.shape[1]
+    return irm, magnitude[:, :n_frames]
+
+
+def separate_nmf(
+    audio: np.ndarray,
+    attention_weights: np.ndarray,
+    sr: int = SAMPLE_RATE,
+    n_components: int = N_COMPONENTS,
+    component_sharpening: float = 3.0,
+    refine_with_pitch: bool = True,
+    mask_net: "MaskNet | None" = None,
+) -> np.ndarray:
+    """Separate the female voice from the mixture using classifier-guided NMF.
+
+    Full pipeline:
+        1. STFT → magnitude spectrogram V
+        2–5. NMF decomposition + scoring + IRM blending + pitch refinement
+             (delegated to _build_irm)
+        6. [optional] MaskNet CNN refinement of the IRM
+        7. Apply mask to the complex STFT and reconstruct via ISTFT
+
+    Args:
+        audio:                mixture waveform, shape (n_samples,)
+        attention_weights:    per-frame F probability, shape (n_frames,)
+        sr:                   sample rate
+        n_components:         number of NMF components K
+        component_sharpening: sigmoid steepness applied to component scores
+        refine_with_pitch:    if True, apply harmonic floor + male suppression
+        mask_net:             optional MaskNet instance for CNN-based IRM refinement
+
+    Returns:
+        reconstructed waveform, shape (n_samples,)
+    """
+    stft = compute_stft(audio)
+    magnitude = np.abs(stft)
+
+    irm = _build_irm(
+        stft, magnitude, attention_weights, audio,
+        sr, n_components, component_sharpening, refine_with_pitch,
+    )
+
+    if mask_net is not None:
+        n_frames = irm.shape[1]
+        refined = mask_net.refine(magnitude[:, :n_frames], attention_weights, irm)
+        irm = np.clip(refined, 0.0, 1.0).astype(np.float32)
+        logger.debug("IRM post-MaskNet: mean=%.3f", irm.mean())
+
+    n_frames = irm.shape[1]
     masked_stft = stft[:, :n_frames] * irm
     return compute_istft(masked_stft, length=len(audio))
