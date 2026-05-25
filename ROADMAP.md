@@ -1,7 +1,7 @@
 # ROADMAP — Implementation Plan
 
-> **Status:** in progress — Phases 0–6 complete. MaskNet CNN trained and evaluated: +3.9 dB SI-SDR over baseline, improvement confirmed aurally. v0.2.0 ready to tag. Open item: baseline regression investigation (pipeline without MaskNet).
-> **Last updated:** 2026-05-22.
+> **Status:** in progress — Phases 0–6 complete. v0.2.0 tagged. v0.3.0 improvements implemented (code complete, models require retraining): SI-SDR loss, FiLM gender conditioning on MaskNet, DPCRN architecture, GRU smoother.
+> **Last updated:** 2026-05-24.
 
 This document tracks the full implementation plan. It must be consulted and updated at the start of each phase. Decisions taken move from the "Open questions" section into the body of the document.
 
@@ -220,12 +220,93 @@ After further testing (v2 attenuated both voices in overlapping sections), the f
 | 2 | **Train MaskNet** on desktop GPU (12GB VRAM) | ✅ Done — `mask_net.pt`, best val_loss=0.147 |
 | 3 | **Evaluate MaskNet** vs baseline | ✅ Done — SI-SDR +3.945 dB over baseline, audibly confirmed |
 
-### Next tasks (priority order)
+### v0.3.0 — Implemented (2026-05-24, code complete — models require retraining on desktop GPU)
 
-| # | Task | Notes |
+| # | Task | Status | Notes |
+|---|---|---|---|
+| 1 | **SI-SDR loss for MaskNet/DPCRN** | ✅ Code done | `train_mask_net.py`: loss `combined` (default) = 0.7×neg_SI-SDR + 0.3×MSE. `torch.istft` differentiable in loop. |
+| 2 | **FiLM gender conditioning on MaskNet** | ✅ Code done | `mask_net.py`: `_FiLMBlock` + `nn.Embedding(2,16)`. ~82K params (was ~75K). `MaskNet.refine(…, gender=0)`. |
+| 3 | **GRU smoother (replaces HMM)** | ✅ Code done | `smoothing_gru.py`: BiGRU ~26K params. `train_smoothing.py`: BCE on IBM sequences. `attention.py`: auto-selects GRU if loaded. |
+| 4 | **DPCRN architecture** | ✅ Code done | `dpcrn.py`: 8 DualPath blocks (freq Conv2d + time GRU), ~302K params. Drop-in for MaskNet. `--model-type dpcrn` in `train_mask_net.py`. `--dpcrn` in `pipeline.py`. |
+
+### Next steps (retraining required)
+
+To activate the v0.3.0 improvements, retrain all models on desktop GPU:
+
+```bash
+# 1. Retrain MaskNet with combined SI-SDR loss + gender conditioning
+python -m src.ai.train_mask_net --classifier models/classifier.joblib \
+    --gmm models/gender_gmm.joblib --n-samples 200 --loss combined --out models/mask_net.pt
+
+# 2. (Optional) Train DPCRN as MaskNet replacement
+python -m src.ai.train_mask_net --model-type dpcrn --classifier models/classifier.joblib \
+    --gmm models/gender_gmm.joblib --n-samples 200 --loss combined --out models/dpcrn.pt
+
+# 3. Train GRU smoother
+python -m src.ai.train_smoothing --classifier models/classifier.joblib \
+    --gmm models/gender_gmm.joblib --n-samples 200 --out models/smoothing_gru.pt
+```
+
+Then evaluate with `notebooks/02_evaluation.ipynb`.
+
+### Research: candidate improvements to MaskNet / separation stage (2026-05-23)
+
+Four approaches identified during baseline investigation. Listed from lowest to highest implementation cost.
+
+#### Option A — SI-SDR loss for MaskNet (recommended first step)
+
+Replace the current MSE training loss in `train_mask_net.py` with SI-SDR loss, optionally combined as `0.7 * SI-SDR_loss + 0.3 * MSE`:
+
+- **Why it helps:** MSE minimises per-bin squared error, which does not correlate strongly with perceived separation quality. SI-SDR is the primary evaluation metric — aligning training and evaluation loss removes the optimisation mismatch.
+- **SI-SDR loss formulation:** `L = −SI-SDR(target_waveform, reconstructed_waveform)`. Requires applying the mask to the STFT, performing ISTFT inside the training loop (differentiable via `torch.stft`/`torch.istft`), and computing SI-SDR on the output waveform.
+- **Cost:** ~30 lines of change in `train_mask_net.py` + `mask_net.py`. Requires GPU retraining (~same time as current training).
+- **Files to change:** `src/ai/train_mask_net.py`, `src/ai/mask_net.py`.
+
+#### Option B — Gender conditioning on MaskNet
+
+Add a learnable gender embedding (2-class → 16-dim) as a conditioning signal to MaskNet:
+
+- **Why it helps:** the current MaskNet receives the attention weights as a channel but has no explicit knowledge of the target gender. Conditioning on a gender vector biases the mask refinement toward the expected spectral characteristics of the target (female: higher harmonics, narrower pitch range; male: lower fundamental, more energy below 500 Hz). This also strengthens the theoretical link to "cocktail party attention".
+- **Architecture change:** embed `gender ∈ {0, 1}` → 16-dim vector via `nn.Embedding`; broadcast and concatenate as a 4th input channel (or use FiLM-style affine conditioning on each conv layer).
+- **Cost:** ~5K extra params. `build_input()` in `mask_net.py` gains a `gender` argument; `train_mask_net.py` extracts gender from speaker metadata. No change to pipeline CLI.
+- **Files to change:** `src/ai/mask_net.py`, `src/ai/train_mask_net.py`.
+
+#### Option C — GRU temporal smoothing (replace HMM)
+
+Replace `hmm_smooth()` in `src/ai/smoothing.py` with a 1-layer bidirectional GRU (~30K params):
+
+- **Why it helps:** the HMM uses fixed transition probabilities (`p_ff=0.95`, `p_mf=0.20`) tuned manually. A GRU learns optimal temporal dynamics from data, handling variable-length speaker turns and partial overlaps better than a fixed-topology HMM.
+- **Integration:** `GRUSmooother` class with a `smooth(mask: np.ndarray) -> np.ndarray` interface, drop-in replacement for `hmm_smooth()`. Requires a short training script (supervised on IBM frame sequences from the existing dataset).
+- **Cost:** new file `src/ai/smoothing_gru.py` + `train_smoothing.py`. Adds a third model artifact (`smoothing_gru.pt`). Pipeline needs a `--smoothing-gru` CLI flag.
+- **Files to change/add:** `src/ai/smoothing_gru.py` (new), `src/ai/train_smoothing.py` (new), `src/ai/attention.py`, `src/pipeline.py`.
+
+#### Option D — DPCRN / Conv-TasNet as MaskNet replacement
+
+Replace the 5-layer CNN (75K params) with a DPCRN (~300K, T-F domain) or Conv-TasNet (time domain):
+
+- **DPCRN:** dilated convolutions + gated RNN, operates on the STFT magnitude. Nearest-drop-in replacement for MaskNet — same input/output format. Better long-range frequency context than plain Conv2d. ~300K params, CPU-feasible with quantization.
+- **Conv-TasNet:** end-to-end time-domain model, bypasses STFT entirely. Best theoretical performance but breaks the existing STFT-based pipeline; NMF/IRM preprocessing cannot be used as input. Higher complexity (~2M params in typical configs).
+- **Recommendation:** start with DPCRN if this option is chosen — same T-F domain, compatible with the existing `_build_irm()` pipeline.
+- **Cost:** high. New architecture file, full retraining, potential pipeline restructure for Conv-TasNet.
+
+---
+
+### Baseline regression investigation (closed — 2026-05-23)
+
+The −0.228 dB figure from 2026-05-22 was **not a systematic regression**. Root cause: the old +2.680 dB was measured on a single easy demo sample (N_FEATURES=44 models), while −0.228 was measured on 6 harder samples with retrained models — comparing different evaluation sets.
+
+Fresh 6-sample evaluation with current models (seed=99, SNR≈0 dB):
+
+| Configuration | Avg SI-SDR (dB) | Δ vs mix |
 |---|---|---|
-| 1 | **Investigate baseline regression** | Pipeline without MaskNet: −0.228 dB (was +2.680 dB pre-retraining). Root cause unknown — likely GMM calibration or NMF parameter sensitivity after N_FEATURES change. |
-| 2 | **FastICA pre-separation** | Investigate ICA on mono signal as feature pre-processor (sklearn.decomposition) |
+| Mix (input) | +0.096 | — |
+| MLP only (no GMM) | +1.442 | **+1.346** |
+| MLP + GMM (w=0.4) | +1.762 | **+1.666** |
+
+Observations:
+- **GMM bias**: on mixture input, `gmm_proba mean ≈ 0.393` (slightly male-biased), caused by LPC coefficients of a 2-speaker mix not matching the clean-speech GMM distribution. Despite this, the blend still helps (+0.32 dB avg). No fix needed.
+- **Occasional failures**: some samples yield negative ΔSI-SDR (e.g. −2.49 dB), likely where NMF decomposition fails or M/F pitch ranges overlap. These are not caused by the retrained models.
+- **Comments fixed**: stale "44-dim" comments in `attention.py` and `train_gmm.py` updated to `N_FEATURES`.
 
 ## Post-release improvements (v0.2.0)
 

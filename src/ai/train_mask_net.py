@@ -1,6 +1,6 @@
-"""Training script for MaskNet — second-stage, requires pre-trained classifier + GMM.
+"""Training script for MaskNet / DPCRN — second-stage, requires pre-trained classifier + GMM.
 
-MaskNet learns to refine the NMF-guided IRM using the full DSP+AI pipeline
+Both models learn to refine the NMF-guided IRM using the full DSP+AI pipeline
 outputs as input, supervised against the ideal IRM computed from clean sources:
 
     IRM_target(f, t) = |F(f,t)|² / (|F(f,t)|² + |M(f,t)|² + ε)
@@ -8,9 +8,17 @@ outputs as input, supervised against the ideal IRM computed from clean sources:
 Training data is generated on-the-fly from LibriSpeech, reusing the same
 make_samples() utility used for MLP training.
 
+Loss options:
+  mse      — Mean-squared error on the IRM (original, per-bin)
+  sisdr    — Negative SI-SDR on reconstructed waveforms (primary metric alignment)
+  combined — 0.7 * neg_SI-SDR + 0.3 * MSE (default — metric-aligned + stable)
+
 Usage:
-    # Minimal (assumes pre-trained models at default paths):
+    # Minimal (MaskNet, combined loss):
     python -m src.ai.train_mask_net
+
+    # DPCRN with combined loss:
+    python -m src.ai.train_mask_net --model-type dpcrn --out models/dpcrn.pt
 
     # Full options:
     python -m src.ai.train_mask_net \\
@@ -20,6 +28,7 @@ Usage:
         --snr-db -3.0 0.0 3.0 \\
         --epochs 50 \\
         --batch-size 8 \\
+        --loss combined \\
         --out models/mask_net.pt
 """
 from __future__ import annotations
@@ -30,13 +39,79 @@ from pathlib import Path
 
 import numpy as np
 
+from src.dsp.stft import HOP_LENGTH, N_FFT
+
 logger = logging.getLogger(__name__)
 
 # Fixed number of STFT frames used for batching.
 # At SR=16000, HOP=128, clip_duration=4.0s → librosa produces ~501 frames.
 # We truncate/pad all samples to this length so the DataLoader can collate
 # without a custom collate_fn.
-FIXED_FRAMES = 500
+FIXED_FRAMES: int = 500
+FIXED_SAMPLES: int = FIXED_FRAMES * HOP_LENGTH   # 64000 — approx. waveform length
+
+
+def _si_sdr_loss(pred: "torch.Tensor", target: "torch.Tensor", eps: float = 1e-8) -> "torch.Tensor":
+    """Negative SI-SDR (to minimise). Computed per batch element, then averaged.
+
+    SI-SDR = 10 log10(||s_target||² / ||e_noise||²)
+    where s_target = (⟨target, pred⟩ / ||target||²) · target
+          e_noise  = pred − s_target
+
+    Args:
+        pred:   (B, n_samples) predicted waveforms
+        target: (B, n_samples) clean target waveforms
+
+    Returns:
+        scalar — mean negative SI-SDR over the batch
+    """
+    import torch
+    target = target - target.mean(dim=-1, keepdim=True)
+    pred   = pred   - pred.mean(dim=-1, keepdim=True)
+
+    dot            = (target * pred).sum(dim=-1, keepdim=True)
+    target_energy  = (target ** 2).sum(dim=-1, keepdim=True) + eps
+    s_target       = (dot / target_energy) * target
+    e_noise        = pred - s_target
+
+    si_sdr = 10.0 * torch.log10(
+        (s_target ** 2).sum(dim=-1) / ((e_noise ** 2).sum(dim=-1) + eps) + eps
+    )
+    return -si_sdr.mean()
+
+
+def _reconstruct_waveform(
+    mask: "torch.Tensor",
+    stft_real: "torch.Tensor",
+    stft_imag: "torch.Tensor",
+    device: "torch.device | str",
+) -> "torch.Tensor":
+    """Apply mask to complex STFT and reconstruct waveforms via ISTFT.
+
+    Args:
+        mask:      (B, F, T) predicted mask in [0, 1]
+        stft_real: (B, F, T) real part of mix STFT
+        stft_imag: (B, F, T) imaginary part of mix STFT
+        device:    target torch device
+
+    Returns:
+        (B, FIXED_SAMPLES) reconstructed waveforms
+    """
+    import torch
+    window = torch.hann_window(N_FFT, device=device)
+    mix_stft = torch.complex(stft_real, stft_imag)   # (B, F, T)
+    masked_stft = mix_stft * mask                     # element-wise: real × complex
+    return torch.istft(
+        masked_stft,
+        n_fft=N_FFT,
+        hop_length=HOP_LENGTH,
+        win_length=N_FFT,
+        window=window,
+        center=True,
+        normalized=False,
+        onesided=True,
+        length=FIXED_SAMPLES,
+    )   # (B, FIXED_SAMPLES)
 
 
 def _compute_target_irm(target: np.ndarray, interferer: np.ndarray) -> np.ndarray:
@@ -65,11 +140,14 @@ def build_dataset(
     n_samples: int,
     snr_db_list: list[float],
     clip_duration: float,
-) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
-    """Generate (magnitude, attention_weights, nmf_irm, target_irm) tuples.
+) -> list[tuple]:
+    """Generate training tuples.
 
-    Each tuple represents one training sample with all arrays aligned to
-    FIXED_FRAMES time steps.
+    Each tuple:
+        (magnitude, attention_weights, nmf_irm, target_irm,
+         mix_stft_real, mix_stft_imag, target_waveform)
+
+    All arrays are aligned to FIXED_FRAMES time steps; waveforms to FIXED_SAMPLES.
     """
     from src.ai.attention import AttentionModule
     from src.ai.classifier import SpeakerClassifier
@@ -84,7 +162,7 @@ def build_dataset(
         gmm = GenderGMM.load(gmm_path)
     attention_module = AttentionModule(classifier, gmm=gmm)
 
-    items: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+    items: list[tuple] = []
 
     for snr in snr_db_list:
         logger.info("Generating %d samples at SNR=%.1f dB...", n_samples, snr)
@@ -99,27 +177,40 @@ def build_dataset(
                 logger.info("  %d/%d processed", i + 1, len(samples))
 
             mix = sample.mixture
-            sr = sample.sr
+            sr  = sample.sr
 
-            magnitude = np.abs(compute_stft(mix))           # (F, T_stft)
-            attn = attention_module.compute_mask(mix, sr=sr, smooth=True)
-            nmf_irm, _ = compute_nmf_irm(mix, attn, sr=sr)  # (F, T_nmf)
+            stft      = compute_stft(mix)
+            magnitude = np.abs(stft)
+            attn      = attention_module.compute_mask(mix, sr=sr, smooth=True)
+            nmf_irm, _ = compute_nmf_irm(mix, attn, sr=sr)
             target_irm = _compute_target_irm(sample.target, sample.interferer)
 
-            # Align all arrays to FIXED_FRAMES
-            mag_f  = _pad_or_trim(magnitude,  FIXED_FRAMES)  # (F, FIXED)
+            # Align all spectral arrays to FIXED_FRAMES
+            mag_f  = _pad_or_trim(magnitude,  FIXED_FRAMES)
             irm_f  = _pad_or_trim(nmf_irm,    FIXED_FRAMES)
             tgt_f  = _pad_or_trim(target_irm, FIXED_FRAMES)
+            stft_f = _pad_or_trim(stft,       FIXED_FRAMES)
 
-            n_attn = min(len(attn), FIXED_FRAMES)
-            attn_f = np.zeros(FIXED_FRAMES, dtype=np.float32)
+            n_attn  = min(len(attn), FIXED_FRAMES)
+            attn_f  = np.zeros(FIXED_FRAMES, dtype=np.float32)
             attn_f[:n_attn] = attn[:n_attn].astype(np.float32)
+
+            # Target waveform padded to FIXED_SAMPLES
+            tgt_wav = sample.target
+            n_samp  = len(tgt_wav)
+            if n_samp >= FIXED_SAMPLES:
+                tgt_wav_f = tgt_wav[:FIXED_SAMPLES].astype(np.float32)
+            else:
+                tgt_wav_f = np.pad(tgt_wav, (0, FIXED_SAMPLES - n_samp)).astype(np.float32)
 
             items.append((
                 mag_f.astype(np.float32),
                 attn_f,
                 irm_f.astype(np.float32),
                 tgt_f.astype(np.float32),
+                stft_f.real.astype(np.float32),
+                stft_f.imag.astype(np.float32),
+                tgt_wav_f,
             ))
 
     logger.info("Dataset ready: %d total samples", len(items))
@@ -137,6 +228,8 @@ def train(
     lr: float,
     out: str,
     device: str | None,
+    loss_type: str,
+    model_type: str,
 ) -> None:
     try:
         import torch
@@ -144,7 +237,7 @@ def train(
         from torch.utils.data import DataLoader, Dataset
     except ImportError as exc:
         raise ImportError(
-            "PyTorch is required for MaskNet training. Install with: pip install torch"
+            "PyTorch is required for training. Install with: pip install torch"
         ) from exc
 
     from src.ai.mask_net import MaskNet, build_input
@@ -156,7 +249,7 @@ def train(
         classifier_path, gmm_path, n_samples, snr_db_list, clip_duration,
     )
 
-    class _MaskDataset(Dataset):
+    class _Dataset(Dataset):
         def __init__(self, items: list) -> None:
             self.items = items
 
@@ -164,18 +257,21 @@ def train(
             return len(self.items)
 
         def __getitem__(self, idx: int):
-            mag, attn, irm, target = self.items[idx]
-            x = build_input(mag, attn, irm)          # (3, F, FIXED)
+            mag, attn, irm, target_irm, stft_r, stft_i, tgt_wav = self.items[idx]
+            x = build_input(mag, attn, irm)   # (3, F, FIXED_FRAMES)
             return (
                 torch.from_numpy(x),
-                torch.from_numpy(target),            # (F, FIXED)
+                torch.from_numpy(target_irm),         # (F, FIXED_FRAMES)
+                torch.from_numpy(stft_r),             # (F, FIXED_FRAMES)
+                torch.from_numpy(stft_i),             # (F, FIXED_FRAMES)
+                torch.from_numpy(tgt_wav),            # (FIXED_SAMPLES,)
             )
 
     n_val = max(1, len(raw_items) // 10)
     val_items, train_items = raw_items[:n_val], raw_items[n_val:]
 
-    train_loader = DataLoader(_MaskDataset(train_items), batch_size=batch_size, shuffle=True)
-    val_loader   = DataLoader(_MaskDataset(val_items),   batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(_Dataset(train_items), batch_size=batch_size, shuffle=True)
+    val_loader   = DataLoader(_Dataset(val_items),   batch_size=batch_size, shuffle=False)
     logger.info(
         "Train: %d samples  |  Val: %d samples  |  Batch size: %d",
         len(train_items), len(val_items), batch_size,
@@ -184,11 +280,27 @@ def train(
     # ------------------------------------------------------------------ #
     # Model, optimizer, scheduler                                          #
     # ------------------------------------------------------------------ #
-    net = MaskNet(device=device)
-    logger.info("MaskNet params: %d  |  Device: %s", net._model.n_params, net._device)
+    if model_type == "dpcrn":
+        from src.ai.dpcrn import DPCRN
+        net_wrapper = DPCRN(device=device)
+        model_obj   = net_wrapper._model
+        dev         = net_wrapper._device
+        logger.info("DPCRN params: %d  |  Device: %s", model_obj.n_params, dev)
+    else:
+        net_wrapper = MaskNet(device=device)
+        model_obj   = net_wrapper._model
+        dev         = net_wrapper._device
+        logger.info("MaskNet params: %d  |  Device: %s", model_obj.n_params, dev)
 
-    optimizer = torch.optim.Adam(net._model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model_obj.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    # Gender tensor — always 0 (female target) for current pipeline
+    _FEMALE = torch.zeros(batch_size, dtype=torch.long)
+
+    use_sisdr = loss_type in ("sisdr", "combined")
+    sisdr_weight = 0.7 if loss_type == "combined" else 1.0
+    mse_weight   = 0.3 if loss_type == "combined" else 0.0
 
     out_path = Path(out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -198,23 +310,57 @@ def train(
     # Training loop                                                        #
     # ------------------------------------------------------------------ #
     for epoch in range(1, epochs + 1):
-        net._model.train()
+        model_obj.train()
         train_loss = 0.0
-        for x, y in train_loader:
-            x, y = x.to(net._device), y.to(net._device)
+
+        for x, y_irm, stft_r, stft_i, tgt_wav in train_loader:
+            x, y_irm = x.to(dev), y_irm.to(dev)
+            stft_r, stft_i, tgt_wav = stft_r.to(dev), stft_i.to(dev), tgt_wav.to(dev)
+            B = x.shape[0]
+
             optimizer.zero_grad()
-            loss = F.mse_loss(net._model(x), y)
+
+            if model_type == "dpcrn":
+                pred_mask = model_obj(x)
+            else:
+                gender_t = _FEMALE[:B].to(dev)
+                pred_mask = model_obj(x, gender_t)
+
+            loss = torch.tensor(0.0, device=dev)
+            if mse_weight > 0:
+                loss = loss + mse_weight * F.mse_loss(pred_mask, y_irm)
+            if use_sisdr:
+                pred_wav = _reconstruct_waveform(pred_mask, stft_r, stft_i, dev)
+                loss = loss + sisdr_weight * _si_sdr_loss(pred_wav, tgt_wav)
+
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
+
         train_loss /= len(train_loader)
 
-        net._model.eval()
+        model_obj.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for x, y in val_loader:
-                x, y = x.to(net._device), y.to(net._device)
-                val_loss += F.mse_loss(net._model(x), y).item()
+            for x, y_irm, stft_r, stft_i, tgt_wav in val_loader:
+                x, y_irm = x.to(dev), y_irm.to(dev)
+                stft_r, stft_i, tgt_wav = stft_r.to(dev), stft_i.to(dev), tgt_wav.to(dev)
+                B = x.shape[0]
+
+                if model_type == "dpcrn":
+                    pred_mask = model_obj(x)
+                else:
+                    gender_t = _FEMALE[:B].to(dev)
+                    pred_mask = model_obj(x, gender_t)
+
+                v = torch.tensor(0.0, device=dev)
+                if mse_weight > 0:
+                    v = v + mse_weight * F.mse_loss(pred_mask, y_irm)
+                if use_sisdr:
+                    pred_wav = _reconstruct_waveform(pred_mask, stft_r, stft_i, dev)
+                    v = v + sisdr_weight * _si_sdr_loss(pred_wav, tgt_wav)
+                val_loss += v.item()
+
         val_loss /= len(val_loader)
 
         scheduler.step()
@@ -226,7 +372,7 @@ def train(
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            net.save(out_path)
+            net_wrapper.save(out_path)
             logger.info("  ↳ new best — checkpoint saved")
 
     logger.info("Done. Best val_loss=%.5f  →  %s", best_val_loss, out_path)
@@ -239,7 +385,19 @@ def main() -> None:
     )
 
     parser = argparse.ArgumentParser(
-        description="Train MaskNet (second-stage: requires classifier + GMM)."
+        description="Train MaskNet or DPCRN (second-stage: requires classifier + GMM)."
+    )
+    parser.add_argument(
+        "--model-type", choices=["masknet", "dpcrn"], default="masknet",
+        help="Model architecture to train. Default: masknet.",
+    )
+    parser.add_argument(
+        "--loss", choices=["mse", "sisdr", "combined"], default="combined",
+        help=(
+            "Training loss. 'mse': per-bin MSE on IRM. "
+            "'sisdr': negative SI-SDR on reconstructed waveforms. "
+            "'combined': 0.7*neg_SI-SDR + 0.3*MSE (default)."
+        ),
     )
     parser.add_argument(
         "--classifier", default="models/classifier.joblib",
@@ -294,6 +452,8 @@ def main() -> None:
         lr=args.lr,
         out=args.out,
         device=args.device,
+        loss_type=args.loss,
+        model_type=args.model_type,
     )
 
 

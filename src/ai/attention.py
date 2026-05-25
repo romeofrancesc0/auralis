@@ -26,11 +26,10 @@ class AttentionModule:
     distribution of each gender — complementary to the MLP's discriminative output
     which is trained on mixed frames with IBM labels.
 
-    When smooth=True (default), the blended mask is post-processed with a
-    2-state HMM (forward-backward) that:
-      - enforces temporal coherence (no isolated frame flips)
-      - biases toward the female state via asymmetric transition probabilities
-      - eliminates the choppiness caused by rapid M/F frame-level switches
+    Smoothing (smooth=True, default):
+      - If a GRUSmoother is provided, uses the learned GRU temporal smoother.
+      - Otherwise falls back to the 2-state HMM (forward-backward).
+    Both options enforce temporal coherence and reduce mask choppiness.
     """
 
     def __init__(
@@ -38,10 +37,12 @@ class AttentionModule:
         classifier: SpeakerClassifier,
         gmm=None,
         gmm_weight: float = GMM_WEIGHT,
+        gru_smoother=None,
     ) -> None:
-        self.classifier = classifier
-        self.gmm = gmm
-        self.gmm_weight = gmm_weight
+        self.classifier   = classifier
+        self.gmm          = gmm
+        self.gmm_weight   = gmm_weight
+        self.gru_smoother = gru_smoother  # optional GRUSmoother instance
 
     def compute_mask(
         self,
@@ -54,8 +55,7 @@ class AttentionModule:
         Args:
             audio:  mono waveform of the mixture, shape (n_samples,)
             sr:     sample rate
-            smooth: if True, apply HMM forward-backward smoothing to enforce
-                    temporal coherence and reduce mask choppiness
+            smooth: if True, apply temporal smoothing (GRU if available, else HMM)
 
         Returns:
             mask: shape (n_frames,), values in [0, 1]
@@ -69,16 +69,19 @@ class AttentionModule:
         mask = proba[:, TARGET_CLASS_IDX]              # (n_frames,)
 
         if self.gmm is not None:
-            # GMM uses flat 44-dim features — the same space it was trained on.
-            # Re-extracting avoids re-using the windowed representation.
-            X_flat = extract_all(audio, sr=sr).T       # (n_frames, 44)
+            # GMM uses flat N_FEATURES-dim features, not the windowed representation.
+            # Re-extracting avoids passing the windowed MLP input to the GMM.
+            X_flat = extract_all(audio, sr=sr).T       # (n_frames, N_FEATURES)
             gmm_proba = self.gmm.score_proba(X_flat)   # (n_frames,)
             n = min(len(mask), len(gmm_proba))
             mask = (1.0 - self.gmm_weight) * mask[:n] + self.gmm_weight * gmm_proba[:n]
 
         if smooth:
-            from src.ai.smoothing import hmm_smooth
-            mask = hmm_smooth(mask)
+            if self.gru_smoother is not None:
+                mask = self.gru_smoother.smooth(mask)
+            else:
+                from src.ai.smoothing import hmm_smooth
+                mask = hmm_smooth(mask)
 
         return mask
 

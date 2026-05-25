@@ -36,10 +36,10 @@ def _collect_features(
     sr: int,
     seed: int = 42,
 ) -> np.ndarray:
-    """Extract flat 44-dim features from n_clips clean audio files.
+    """Extract flat N_FEATURES-dim features from n_clips clean audio files.
 
     Returns:
-        X: (n_frames_total, 44)
+        X: (n_frames_total, N_FEATURES)
     """
     rng = random.Random(seed)
     n_samples = int(sr * clip_duration)
@@ -59,8 +59,8 @@ def _collect_features(
         else:
             audio = np.pad(audio, (0, n_samples - len(audio)))
 
-        feat = extract_all(audio, sr=sr)   # (44, n_frames)
-        X_list.append(feat.T)              # → (n_frames, 44)
+        feat = extract_all(audio, sr=sr)   # (N_FEATURES, n_frames)
+        X_list.append(feat.T)              # → (n_frames, N_FEATURES)
 
     return np.vstack(X_list)
 

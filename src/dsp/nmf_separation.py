@@ -234,6 +234,7 @@ def separate_nmf(
     component_sharpening: float = 3.0,
     refine_with_pitch: bool = True,
     mask_net: "MaskNet | None" = None,
+    target_gender: int = 0,
 ) -> np.ndarray:
     """Separate the female voice from the mixture using classifier-guided NMF.
 
@@ -241,7 +242,7 @@ def separate_nmf(
         1. STFT → magnitude spectrogram V
         2–5. NMF decomposition + scoring + IRM blending + pitch refinement
              (delegated to _build_irm)
-        6. [optional] MaskNet CNN refinement of the IRM
+        6. [optional] MaskNet / DPCRN CNN refinement of the IRM
         7. Apply mask to the complex STFT and reconstruct via ISTFT
 
     Args:
@@ -251,7 +252,8 @@ def separate_nmf(
         n_components:         number of NMF components K
         component_sharpening: sigmoid steepness applied to component scores
         refine_with_pitch:    if True, apply harmonic floor + male suppression
-        mask_net:             optional MaskNet instance for CNN-based IRM refinement
+        mask_net:             optional MaskNet or DPCRN instance for IRM refinement
+        target_gender:        0=Female (default), 1=Male — passed to MaskNet conditioning
 
     Returns:
         reconstructed waveform, shape (n_samples,)
@@ -266,7 +268,9 @@ def separate_nmf(
 
     if mask_net is not None:
         n_frames = irm.shape[1]
-        refined = mask_net.refine(magnitude[:, :n_frames], attention_weights, irm)
+        refined = mask_net.refine(
+            magnitude[:, :n_frames], attention_weights, irm, gender=target_gender
+        )
         irm = np.clip(refined, 0.0, 1.0).astype(np.float32)
         logger.debug("IRM post-MaskNet: mean=%.3f", irm.mean())
 
