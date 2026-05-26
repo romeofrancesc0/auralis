@@ -1,7 +1,7 @@
 # ROADMAP — Implementation Plan
 
-> **Status:** in progress — Phases 0–6 complete. v0.2.0 tagged. v0.3.0 improvements implemented (code complete, models require retraining): SI-SDR loss, FiLM gender conditioning on MaskNet, DPCRN architecture, GRU smoother.
-> **Last updated:** 2026-05-24.
+> **Status:** in progress — Phases 0–6 complete. v0.2.0 tagged. v0.2.1: SI-SDR loss, FiLM conditioning, DPCRN, GRU smoother — code complete, bugs fixed, models require retraining. v0.3.0 will be tagged after metric validation.
+> **Last updated:** 2026-05-26.
 
 This document tracks the full implementation plan. It must be consulted and updated at the start of each phase. Decisions taken move from the "Open questions" section into the body of the document.
 
@@ -220,7 +220,9 @@ After further testing (v2 attenuated both voices in overlapping sections), the f
 | 2 | **Train MaskNet** on desktop GPU (12GB VRAM) | ✅ Done — `mask_net.pt`, best val_loss=0.147 |
 | 3 | **Evaluate MaskNet** vs baseline | ✅ Done — SI-SDR +3.945 dB over baseline, audibly confirmed |
 
-### v0.3.0 — Implemented (2026-05-24, code complete — models require retraining on desktop GPU)
+### v0.2.1 — Code complete (2026-05-24 committed, bugs fixed 2026-05-26)
+
+> **v0.3.0 will be tagged only after metric validation on a trained model.**
 
 | # | Task | Status | Notes |
 |---|---|---|---|
@@ -229,25 +231,34 @@ After further testing (v2 attenuated both voices in overlapping sections), the f
 | 3 | **GRU smoother (replaces HMM)** | ✅ Code done | `smoothing_gru.py`: BiGRU ~26K params. `train_smoothing.py`: BCE on IBM sequences. `attention.py`: auto-selects GRU if loaded. |
 | 4 | **DPCRN architecture** | ✅ Code done | `dpcrn.py`: 8 DualPath blocks (freq Conv2d + time GRU), ~302K params. Drop-in for MaskNet. `--model-type dpcrn` in `train_mask_net.py`. `--dpcrn` in `pipeline.py`. |
 
-### Next steps (retraining required)
+**Bugs fixed (2026-05-26, smoke tests on Mac MPS):**
+- `train_smoothing.py` — `raw_mask` (float64) cast to float32 before tensor creation; MPS rejects float64.
+- `dpcrn.py` — added `.contiguous()` after each `.permute()` in `_DualPathBlock.forward()`; MPS backward pass requires contiguous tensors.
 
-To activate the v0.3.0 improvements, retrain all models on desktop GPU:
+**Training feasibility on Mac MPS (Apple Silicon):**
+| Model | Params | Estimated time (200 samples × 3 SNR × 50 epochs) |
+|---|---|---|
+| GRUSmoother | 26K | ~40 min |
+| MaskNet | 82K | ~2–3 h |
+| DPCRN | 302K | ~100 h — **GPU desktop required** |
+
+### Next steps (retraining required for v0.3.0 validation)
 
 ```bash
-# 1. Retrain MaskNet with combined SI-SDR loss + gender conditioning
+# On Mac (MPS): train MaskNet and GRU smoother
 python -m src.ai.train_mask_net --classifier models/classifier.joblib \
     --gmm models/gender_gmm.joblib --n-samples 200 --loss combined --out models/mask_net.pt
 
-# 2. (Optional) Train DPCRN as MaskNet replacement
-python -m src.ai.train_mask_net --model-type dpcrn --classifier models/classifier.joblib \
-    --gmm models/gender_gmm.joblib --n-samples 200 --loss combined --out models/dpcrn.pt
-
-# 3. Train GRU smoother
 python -m src.ai.train_smoothing --classifier models/classifier.joblib \
     --gmm models/gender_gmm.joblib --n-samples 200 --out models/smoothing_gru.pt
+
+# On GPU desktop only: train DPCRN
+python -m src.ai.train_mask_net --model-type dpcrn --classifier models/classifier.joblib \
+    --gmm models/gender_gmm.joblib --n-samples 200 --loss combined --out models/dpcrn.pt
 ```
 
-Then evaluate with `notebooks/02_evaluation.ipynb`.
+Then evaluate all variants with `notebooks/02_evaluation.ipynb` and compare vs v0.2.0 baseline (+3.945 dB SI-SDR).
+Tag v0.3.0 only if at least one variant improves the SI-SDR metric.
 
 ### Research: candidate improvements to MaskNet / separation stage (2026-05-23)
 

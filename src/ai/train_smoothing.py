@@ -132,8 +132,8 @@ def train(
 
         def __getitem__(self, idx: int):
             raw, ibm = self.items[idx]
-            x = torch.from_numpy(raw).unsqueeze(-1)    # (T, 1)
-            y = torch.from_numpy(ibm).unsqueeze(-1)    # (T, 1) — 0=F, 1=M
+            x = torch.from_numpy(raw.astype(np.float32)).unsqueeze(-1)   # (T, 1)
+            y = torch.from_numpy(ibm).unsqueeze(-1)                       # (T, 1) — 0=F, 1=M
             # Invert IBM so target is 1=F-dominant (matches attention mask convention)
             y_f = 1.0 - y
             return x, y_f

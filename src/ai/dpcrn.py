@@ -63,13 +63,13 @@ try:
             x = x + h
 
             # Inter-frame path (time)
-            # Reshape: each frequency bin is an independent batch element
-            x_t = x.permute(0, 2, 3, 1).reshape(B * F, T, C)   # (B*F, T, C)
-            h_t, _ = self.inter_gru(x_t)                         # (B*F, T, C)
+            # .contiguous() required before reshape on MPS (non-contiguous permute)
+            x_t = x.permute(0, 2, 3, 1).contiguous().reshape(B * F, T, C)   # (B*F, T, C)
+            h_t, _ = self.inter_gru(x_t)                                      # (B*F, T, C)
             # BatchNorm1d expects (N, C, L) for sequence data
-            h_t = self.inter_bn(h_t.permute(0, 2, 1)).permute(0, 2, 1)
+            h_t = self.inter_bn(h_t.permute(0, 2, 1).contiguous()).permute(0, 2, 1).contiguous()
             x_t = x_t + h_t
-            x = x_t.reshape(B, F, T, C).permute(0, 3, 1, 2)     # (B, C, F, T)
+            x = x_t.reshape(B, F, T, C).permute(0, 3, 1, 2).contiguous()    # (B, C, F, T)
 
             return x
 
