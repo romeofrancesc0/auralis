@@ -4,7 +4,7 @@ from __future__ import annotations
 import librosa
 import numpy as np
 
-from src.dsp.stft import HOP_LENGTH, N_FFT, compute_istft, compute_stft
+from src.dsp.stft import HOP_LENGTH, N_FFT
 from src.utils import SAMPLE_RATE
 
 # Pitch ranges (Hz) — kept non-overlapping to avoid cross-detection
@@ -150,81 +150,3 @@ def compute_male_suppression_mask(
     return mask
 
 
-def compute_ratio_mask(attention_weights: np.ndarray, n_freqs: int) -> np.ndarray:
-    """Broadcast per-frame attention weights to shape (n_freqs, n_frames)."""
-    return np.tile(attention_weights, (n_freqs, 1))
-
-
-def apply_mask(stft_matrix: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Apply a real-valued mask to a complex STFT matrix."""
-    n_frames = stft_matrix.shape[1]
-    return stft_matrix * mask[:, :n_frames]
-
-
-def separate(
-    audio: np.ndarray,
-    attention_weights: np.ndarray,
-    sr: int = SAMPLE_RATE,
-    mask_power: float = 4.0,
-    pitch_blend: float = 0.7,
-) -> np.ndarray:
-    """Reconstruct the target (female) speaker from the mixture.
-
-    Pipeline:
-        1. Sharpen attention weights via steep sigmoid (frame-level temporal mask)
-        2. Broadcast to ratio mask over all frequency bins
-        3. Compute female pitch mask — preserves F harmonics, attenuates others
-        4. Blend ratio and female pitch masks
-        5. Compute male suppression mask — directly attenuates detected M harmonics
-        6. Apply combined mask to STFT and reconstruct via ISTFT
-
-    Args:
-        audio:             mixture waveform, shape (n_samples,)
-        attention_weights: per-frame F-probability from AttentionModule (n_frames,)
-        sr:                sample rate
-        mask_power:        sigmoid steepness (higher = more binary separation)
-        pitch_blend:       weight of the female pitch mask (0=off, 1=full)
-
-    Returns:
-        reconstructed waveform, shape (n_samples,)
-    """
-    stft = compute_stft(audio)                           # (n_freqs, n_frames_stft)
-    n_freqs, n_frames_stft = stft.shape
-
-    sharp_weights = sharpen_mask(attention_weights, power=mask_power)
-    n_frames = min(len(sharp_weights), n_frames_stft)
-    sharp_weights = sharp_weights[:n_frames]
-    raw_weights = attention_weights[:n_frames]
-
-    ratio_mask = compute_ratio_mask(sharp_weights, n_freqs)
-
-    pitch_mask, harmonic_bins = compute_pitch_mask(audio, sr=sr, n_fft=N_FFT, hop_length=HOP_LENGTH)
-    pitch_mask = pitch_mask[:, :n_frames]
-    harmonic_bins = harmonic_bins[:, :n_frames]
-
-    male_mask = compute_male_suppression_mask(audio, sr=sr, n_fft=N_FFT, hop_length=HOP_LENGTH)
-    male_mask = male_mask[:, :n_frames]
-    male_harmonic_bins = male_mask < 0.5
-
-    # Step 1 — base: ratio mask blended with female pitch mask
-    combined = ratio_mask * ((1.0 - pitch_blend) + pitch_blend * pitch_mask)
-
-    # Step 2 — cap broadband bins in uncertain frames.
-    # When the classifier is near 0.5, both voices are present; capping at UNCERTAIN_CAP
-    # halves the male broadband leakage without touching bins that pitch will rescue.
-    uncertain_frames = (raw_weights >= 0.4) & (raw_weights <= 0.6)
-    combined[:, uncertain_frames] = np.minimum(
-        combined[:, uncertain_frames], UNCERTAIN_CAP
-    )
-
-    # Step 3 — female harmonic floor: confirmed F harmonic bins are raised to at least
-    # HARMONIC_FLOOR regardless of classifier uncertainty. Pitch evidence is more
-    # reliable than frame-level classification in concurrent-speech frames.
-    combined = np.where(harmonic_bins, np.maximum(combined, HARMONIC_FLOOR), combined)
-
-    # Step 4 — male harmonic suppression: applied last so it overrides the female floor
-    # in the rare case where both pitch tracks claim the same bin.
-    combined = np.where(male_harmonic_bins, np.minimum(combined, MALE_SUPPRESSION), combined)
-
-    masked_stft = apply_mask(stft, combined)
-    return compute_istft(masked_stft, length=len(audio))
