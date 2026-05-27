@@ -16,6 +16,7 @@ import warnings
 from typing import TYPE_CHECKING
 
 import numpy as np
+from scipy.ndimage import gaussian_filter
 from sklearn.decomposition import NMF
 
 if TYPE_CHECKING:
@@ -33,11 +34,13 @@ from src.dsp.separation import (
 from src.dsp.stft import HOP_LENGTH, N_FFT, compute_istft, compute_stft
 from src.utils import SAMPLE_RATE
 
-N_COMPONENTS = 8        # NMF components — with 2 speakers, beyond 8 mixed components emerge
-NMF_MAX_ITER = 500
+N_COMPONENTS = 16       # NMF components — 16 gives finer spectral resolution for 2-speaker mixes
+NMF_MAX_ITER = 1000     # generous headroom for mu solver convergence on K=16
 IRM_ATTN_BLEND = 0.75   # weight of attention mask in the hybrid IRM
 IRM_NMF_BLEND = 0.25    # weight of NMF soft mask; must sum to 1 with IRM_ATTN_BLEND
 IRM_FLOOR = 0.15        # global minimum IRM: prevents spectral holes that hurt intelligibility
+IRM_SMOOTH_SIGMA = (1.0, 2.0)   # (freq_bins, time_frames) Gaussian σ — reduces NMF musical noise
+GRIFFIN_LIM_ITERS = 32  # phase reconstruction iterations (0 = keep mix phase, fast but artifacted)
 
 
 def _score_components(H: np.ndarray, attention_weights: np.ndarray) -> np.ndarray:
@@ -164,6 +167,12 @@ def _build_irm(
 
     irm = IRM_ATTN_BLEND * attn_mask + IRM_NMF_BLEND * irm_nmf
     irm = np.clip(irm, 0.0, 1.0).astype(np.float32)
+
+    # 2-D Gaussian smoothing: suppresses NMF musical noise (isolated tonal artefacts)
+    # applied before pitch refinement so harmonic corrections can still override it
+    irm = gaussian_filter(irm.astype(np.float64), sigma=IRM_SMOOTH_SIGMA).astype(np.float32)
+    irm = np.clip(irm, 0.0, 1.0)
+
     logger.debug("IRM pre-pitch: mean=%.3f  >0.6: %d%%  <0.4: %d%%",
                  irm.mean(),
                  int((irm > 0.6).mean() * 100),
@@ -189,6 +198,36 @@ def _build_irm(
         irm = np.where(~male_suppressed_bins, np.maximum(irm, IRM_FLOOR), irm)
 
     return irm
+
+
+def _griffin_lim_reconstruct(
+    target_magnitude: np.ndarray,
+    init_phase: np.ndarray,
+    n_iter: int,
+    length: int,
+) -> np.ndarray:
+    """Phase reconstruction via Griffin-Lim (Griffin & Lim 1984) initialized from mix phase.
+
+    Iteratively enforces STFT consistency on the target magnitude spectrogram.
+    Starting from the mix phase (rather than random) reduces iterations needed
+    and preserves approximate phase structure in the early iterations.
+
+    Args:
+        target_magnitude: masked magnitude spectrogram, shape (n_freqs, n_frames)
+        init_phase:       initial phase estimate (mix phase), shape (n_freqs, n_frames)
+        n_iter:           number of Griffin-Lim iterations
+        length:           target output length in samples
+
+    Returns:
+        reconstructed waveform, shape (length,)
+    """
+    phase = init_phase.copy()
+    for _ in range(n_iter):
+        signal = compute_istft(target_magnitude * np.exp(1j * phase), length=length)
+        stft_iter = compute_stft(signal)
+        n_f, n_t = target_magnitude.shape
+        phase = np.angle(stft_iter[:n_f, :n_t])
+    return compute_istft(target_magnitude * np.exp(1j * phase), length=length)
 
 
 def compute_nmf_irm(
@@ -235,15 +274,16 @@ def separate_nmf(
     refine_with_pitch: bool = True,
     mask_net: "MaskNet | None" = None,
     target_gender: int = 0,
+    griffin_lim_iters: int = GRIFFIN_LIM_ITERS,
 ) -> np.ndarray:
     """Separate the female voice from the mixture using classifier-guided NMF.
 
     Full pipeline:
         1. STFT → magnitude spectrogram V
-        2–5. NMF decomposition + scoring + IRM blending + pitch refinement
+        2–5. NMF decomposition + scoring + IRM blending + Gaussian smoothing + pitch refinement
              (delegated to _build_irm)
         6. [optional] MaskNet / DPCRN CNN refinement of the IRM
-        7. Apply mask to the complex STFT and reconstruct via ISTFT
+        7. Apply mask to magnitude; reconstruct phase via Griffin-Lim (or ISTFT with mix phase)
 
     Args:
         audio:                mixture waveform, shape (n_samples,)
@@ -254,6 +294,7 @@ def separate_nmf(
         refine_with_pitch:    if True, apply harmonic floor + male suppression
         mask_net:             optional MaskNet or DPCRN instance for IRM refinement
         target_gender:        0=Female (default), 1=Male — passed to MaskNet conditioning
+        griffin_lim_iters:    Griffin-Lim phase reconstruction iterations; 0 = use mix phase
 
     Returns:
         reconstructed waveform, shape (n_samples,)
@@ -275,5 +316,14 @@ def separate_nmf(
         logger.debug("IRM post-MaskNet: mean=%.3f", irm.mean())
 
     n_frames = irm.shape[1]
-    masked_stft = stft[:, :n_frames] * irm
-    return compute_istft(masked_stft, length=len(audio))
+    target_magnitude = magnitude[:, :n_frames] * irm
+
+    if griffin_lim_iters > 0:
+        return _griffin_lim_reconstruct(
+            target_magnitude,
+            np.angle(stft[:, :n_frames]),
+            griffin_lim_iters,
+            len(audio),
+        )
+
+    return compute_istft(target_magnitude * np.exp(1j * np.angle(stft[:, :n_frames])), length=len(audio))

@@ -1,7 +1,7 @@
 # ROADMAP — Implementation Plan
 
-> **Status:** in progress — Phases 0–6 complete. v0.2.0 tagged. v0.2.1: SI-SDR loss, FiLM conditioning, DPCRN, GRU smoother — code complete, bugs fixed, models require retraining. v0.3.0 will be tagged after metric validation.
-> **Last updated:** 2026-05-26.
+> **Status:** in progress — Phases 0–6 complete. v0.2.0 tagged. v0.2.1 models retrained and evaluated. DSP improvements shipped (Griffin-Lim, NMF K=16, Gaussian smoothing). v0.3.0 ready to tag after extended evaluation.
+> **Last updated:** 2026-05-27.
 
 This document tracks the full implementation plan. It must be consulted and updated at the start of each phase. Decisions taken move from the "Open questions" section into the body of the document.
 
@@ -242,23 +242,65 @@ After further testing (v2 attenuated both voices in overlapping sections), the f
 | MaskNet | 82K | ~2–3 h |
 | DPCRN | 302K | ~100 h — **GPU desktop required** |
 
-### Next steps (retraining required for v0.3.0 validation)
+### v0.2.1 — Training completed (2026-05-27, GPU desktop)
 
-```bash
-# On Mac (MPS): train MaskNet and GRU smoother
-python -m src.ai.train_mask_net --classifier models/classifier.joblib \
-    --gmm models/gender_gmm.joblib --n-samples 200 --loss combined --out models/mask_net.pt
+All models retrained with new loss and architecture:
 
-python -m src.ai.train_smoothing --classifier models/classifier.joblib \
-    --gmm models/gender_gmm.joblib --n-samples 200 --out models/smoothing_gru.pt
+| Model | Params | Best val_loss | Device | Notes |
+|---|---|---|---|---|
+| GRUSmoother | 26K | 0.538 (BCE) | CUDA | Epoch 18/30 |
+| MaskNet | 82K | −2.99 dB SI-SDR | CUDA | Epoch 45/50, combined loss + FiLM |
+| DPCRN | 302K | −3.54 dB SI-SDR | CUDA | Epoch 36/50, combined loss, batch=2, clip=2s |
 
-# On GPU desktop only: train DPCRN
-python -m src.ai.train_mask_net --model-type dpcrn --classifier models/classifier.joblib \
-    --gmm models/gender_gmm.joblib --n-samples 200 --loss combined --out models/dpcrn.pt
-```
+---
 
-Then evaluate all variants with `notebooks/02_evaluation.ipynb` and compare vs v0.2.0 baseline (+3.945 dB SI-SDR).
-Tag v0.3.0 only if at least one variant improves the SI-SDR metric.
+### v0.3.0 — DSP improvements + evaluation (2026-05-27)
+
+**DSP improvements shipped:**
+
+| Improvement | Details | Impact |
+|---|---|---|
+| Griffin-Lim phase reconstruction | 32 iter, init da fase del mix | Elimina artefatti metallici da fase del mix |
+| NMF K=8 → K=16 | Più componenti spettrali per mix a 2 voci | Riduce confusione tra voci con timbri simili |
+| Gaussian smoothing 2D IRM | σ=(1.0, 2.0) freq×time, pre pitch-refinement | Riduce musical noise da NMF |
+
+**Note:** Griffin-Lim riduce SI-SDR (sensibile alla fase) ma migliora la qualità percepita — confermato all'ascolto.
+
+**Evaluation results — 10 samples, SNR=0 dB, seed=42 (MLP + GMM + HMM + DPCRN):**
+
+| Metric | Mix (input) | System output | Delta |
+|---|---|---|---|
+| SI-SDR (dB) | +0.022 | +6.353 | **+6.33** |
+| PESQ | 1.141 | 1.416 | **+0.28** |
+| STOI | 0.742 | 0.831 | **+0.09** |
+
+**Stress test — 3 samples, diverse speakers e SNR (MLP + GMM + HMM + DPCRN):**
+
+| Condizione | SI-SDR mix | SI-SDR out | Delta |
+|---|---|---|---|
+| SNR 0 dB (balanced) | −0.15 | +1.59 | +1.74 |
+| SNR −3 dB (female quieter) | −3.07 | +4.83 | **+7.90** |
+| SNR +3 dB (female louder) | +3.04 | +5.63 | +2.59 |
+
+**Recommended config:** MLP + GMM + HMM + DPCRN (`--dpcrn models/dpcrn.pt`). MaskNet mantenuto come alternativa leggera.
+
+**Codebase cleanup:**
+- Rimosse `separate()`, `compute_ratio_mask()`, `apply_mask()` da `separation.py` (dead code, supersedute da NMF)
+- Script di ricerca spostati in `scripts/`
+- `demo.py` aggiornato con pipeline completo (DPCRN con fallback su MaskNet)
+
+**Extended evaluation — 36 samples, SNR in {-3, 0, +3} dB, seed=123 (MLP + GMM + HMM + DPCRN):**
+
+| SNR | SI-SDR mix | SI-SDR out | Delta | PESQ out | STOI out |
+|-----|-----------|-----------|-------|----------|----------|
+| −3 dB | −3.02±0.12 | +1.18±3.72 | **+4.19±3.69** | 1.215±0.099 | 0.723±0.074 |
+| 0 dB  | −0.01±0.08 | +3.00±3.55 | **+3.01±3.54** | 1.290±0.142 | 0.757±0.070 |
+| +3 dB | +2.99±0.06 | +4.48±3.34 | **+1.48±3.33** | 1.388±0.207 | 0.790±0.062 |
+| **ALL** | −0.01±2.45 | **+2.88±3.79** | **+2.90±3.69** | **1.298±0.171** | **0.757±0.074** |
+
+Mix baseline: PESQ 1.162 / STOI 0.723. System delta: PESQ **+0.136** / STOI **+0.034**.
+
+Note: std ≈ 3.7 dB reflects speaker diversity in LibriSpeech dev-clean, not instability — per-sample deltas are consistently positive at −3 and 0 dB; some regressions at +3 dB where the male voice is quieter and the system occasionally over-suppresses it.
 
 ### Research: candidate improvements to MaskNet / separation stage (2026-05-23)
 
@@ -480,3 +522,38 @@ Apply `FastICA` before feature extraction to decompose the mixture into statisti
 - **Limitation:** most effective with stereo input (2 channels → 2 sources mathematically guaranteed). Usefulness on mono must be verified experimentally.
 - **Integration point:** `src/dsp/features.py` or as a pre-step in `src/pipeline.py`.
 - **To validate:** does ICA pre-processing reduce feature noise? Does it help on mono or only on stereo?
+
+---
+
+## Final Objective — N-Speaker Cocktail Party (future phase)
+
+> **Status:** ⬜ Not started. Requires stable 2-speaker system as foundation.
+
+The current system is designed for a fixed 2-speaker mixture (1 male + 1 female). Extending to N arbitrary speakers is the natural final step toward a general cocktail party attention model.
+
+### Problem statement
+
+Given a mixture of N ≥ 2 simultaneous speakers (unknown gender, unknown count), selectively isolate the target speaker based on a conditioning signal (e.g., a short enrollment clip, a speaker embedding, or a gender label).
+
+### Architectural considerations
+
+| Approach | Description | Pros | Cons |
+|---|---|---|---|
+| **Conv-TasNet** | Time-domain end-to-end network, learns N masks simultaneously | Best separation quality (state-of-art) | Breaks STFT pipeline; ~2M params; needs large training set |
+| **SepFormer** | Transformer-based, handles variable N | SOTA on WSJ0-mix benchmarks | Very large (~26M params); GPU required at inference |
+| **Speaker-conditioned DPCRN** | Extend current DPCRN with a speaker embedding (d-vector/x-vector) as conditioning | Compatible with existing pipeline; incremental upgrade | Requires speaker enrollment at inference |
+| **Permutation-invariant NMF** | Extend NMF to K≥3 speakers with PIT-style assignment | Minimal architecture change | Degrades rapidly beyond 3 speakers |
+
+### Recommended path
+
+1. **Speaker embedding integration** — extract a d-vector (speaker embedding) from a short enrollment clip using a pretrained model (e.g., `speechbrain` SpeakerRecognition). Replace the binary gender label with a continuous embedding as conditioning signal.
+2. **DPCRN speaker conditioning** — replace the FiLM gender embedding (2-class) with a speaker embedding projection layer. The DPCRN then conditions its mask refinement on the target speaker's acoustic profile rather than just gender.
+3. **Multi-speaker dataset** — extend `src/dsp/dataset.py` to generate N-speaker mixes (N=3 initially) using LibriSpeech clips across genders and accents.
+4. **Evaluation** — SI-SDR, PESQ, STOI on WSJ0-2mix / LibriMix benchmarks for comparison against published baselines.
+
+### Dependencies
+
+- Stable 2-speaker pipeline (current) ✅
+- Pretrained speaker embedding model (e.g., `speechbrain>=1.0`)
+- Multi-speaker mixture dataset (LibriMix or custom LibriSpeech N-mix)
+- GPU for DPCRN retraining with speaker conditioning

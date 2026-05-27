@@ -1,24 +1,22 @@
-"""End-to-end pipeline: mixture → isolated target speaker.
+"""End-to-end pipeline: mixture -> isolated target speaker.
 
-Usage:
-    # Baseline (MLP only)
-    python -m src.pipeline --input mix.wav --model models/classifier.joblib --output out.wav
+Recommended usage (best perceptual quality — MLP + GMM + HMM + DPCRN):
+    python -m src.pipeline --input mix.wav \\
+        --model models/classifier.joblib \\
+        --gmm   models/gender_gmm.joblib \\
+        --dpcrn models/dpcrn.pt \\
+        --output out.wav
 
-    # With GMM blend
-    python -m src.pipeline --input mix.wav --model models/classifier.joblib \\
-        --gmm models/gender_gmm.joblib --output out.wav
+Experimental alternatives (research / ablation only):
+    # MaskNet instead of DPCRN (lighter, slightly lower quality)
+    python -m src.pipeline --input mix.wav \\
+        --model models/classifier.joblib --gmm models/gender_gmm.joblib \\
+        --mask-net models/mask_net.pt --output out.wav
 
-    # With GRU temporal smoother (replaces HMM)
-    python -m src.pipeline --input mix.wav --model models/classifier.joblib \\
-        --gmm models/gender_gmm.joblib --smoothing-gru models/smoothing_gru.pt --output out.wav
-
-    # With MaskNet CNN refinement
-    python -m src.pipeline --input mix.wav --model models/classifier.joblib \\
-        --gmm models/gender_gmm.joblib --mask-net models/mask_net.pt --output out.wav
-
-    # With DPCRN refinement (alternative to MaskNet, higher capacity)
-    python -m src.pipeline --input mix.wav --model models/classifier.joblib \\
-        --gmm models/gender_gmm.joblib --dpcrn models/dpcrn.pt --output out.wav
+    # GRU temporal smoother instead of HMM (useful without a CNN refiner)
+    python -m src.pipeline --input mix.wav \\
+        --model models/classifier.joblib --gmm models/gender_gmm.joblib \\
+        --smoothing-gru models/smoothing_gru.pt --output out.wav
 """
 from __future__ import annotations
 
@@ -100,22 +98,33 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     parser = argparse.ArgumentParser(
-        description="Cocktail party attention: isolate target speaker from mix."
+        description="Cocktail party attention: isolate target speaker from mix.\n\n"
+                    "Recommended (best quality): --model + --gmm + --mask-net",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--input",  required=True, help="Path to input mixture WAV file.")
-    parser.add_argument("--model",  required=True, help="Path to trained classifier (.joblib).")
-    parser.add_argument("--gmm",    default=None,
-                        help="Path to trained GenderGMM (.joblib). Optional.")
-    parser.add_argument("--mask-net", default=None,
-                        help="Path to trained MaskNet (.pt). CNN-based IRM refinement.")
-    parser.add_argument("--dpcrn", default=None,
-                        help="Path to trained DPCRN (.pt). Higher-capacity IRM refinement "
-                             "(takes precedence over --mask-net if both supplied).")
-    parser.add_argument("--smoothing-gru", default=None,
-                        help="Path to trained GRUSmoother (.pt). Replaces HMM smoothing.")
-    parser.add_argument("--output", required=True, help="Path for the output WAV file.")
-    parser.add_argument("--sr", type=int, default=SAMPLE_RATE,
-                        help="Sample rate (default 16000).")
+
+    main = parser.add_argument_group("main options")
+    main.add_argument("--input",  required=True, help="Path to input mixture WAV file.")
+    main.add_argument("--output", required=True, help="Path for the output WAV file.")
+    main.add_argument("--model",  required=True, help="Path to trained classifier (.joblib).")
+    main.add_argument("--gmm",    default=None,
+                      help="Path to trained GenderGMM (.joblib). Recommended.")
+    main.add_argument("--dpcrn", default=None,
+                      help="Path to trained DPCRN (.pt). Recommended CNN refiner (best perceptual quality).")
+    main.add_argument("--sr", type=int, default=SAMPLE_RATE,
+                      help="Sample rate (default 16000).")
+
+    exp = parser.add_argument_group(
+        "experimental options",
+        "These variants are not better than the recommended config in the current evaluation.\n"
+        "Kept for research and ablation studies.",
+    )
+    exp.add_argument("--mask-net", default=None,
+                     help="Path to trained MaskNet (.pt). Lighter alternative to DPCRN; "
+                          "ignored if --dpcrn is also supplied.")
+    exp.add_argument("--smoothing-gru", default=None,
+                     help="Path to trained GRUSmoother (.pt). Alternative to HMM smoothing; "
+                          "does not improve quality when a CNN refiner is active.")
     args = parser.parse_args()
 
     run(
