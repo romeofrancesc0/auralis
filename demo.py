@@ -61,9 +61,13 @@ def main() -> None:
         mask_net = DPCRN.load(DPCRN_PATH)
         log.info("Refiner: DPCRN")
     elif Path(MASKNET_PATH).exists():
-        from src.ai.mask_net import MaskNet
-        mask_net = MaskNet.load(MASKNET_PATH)
-        log.info("Refiner: MaskNet (DPCRN not found)")
+        try:
+            from src.ai.mask_net import MaskNet
+            mask_net = MaskNet.load(MASKNET_PATH)
+            log.info("Refiner: MaskNet (DPCRN not found)")
+        except RuntimeError as e:
+            log.warning("MaskNet load failed (architecture mismatch?): %s", e)
+            log.warning("Running without CNN refiner. Retrain with: python -m src.ai.train_mask_net")
     else:
         log.warning("No CNN refiner found — output quality will be lower.")
 
