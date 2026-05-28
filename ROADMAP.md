@@ -1,7 +1,7 @@
 # ROADMAP — Implementation Plan
 
-> **Status:** in progress — Phases 0–6 complete. v0.2.0 tagged. v0.2.1 models retrained and evaluated. DSP improvements shipped (Griffin-Lim, NMF K=16, Gaussian smoothing). v0.3.0 ready to tag after extended evaluation.
-> **Last updated:** 2026-05-27.
+> **Status:** v0.3.0 tagged and released — SI-SDR +8.11 dB (demo), +6.33 dB avg over 10 samples. All metrics positive. GRUSmoother removed (trained but no improvement over HMM). Codebase clean.
+> **Last updated:** 2026-05-28.
 
 This document tracks the full implementation plan. It must be consulted and updated at the start of each phase. Decisions taken move from the "Open questions" section into the body of the document.
 
@@ -211,6 +211,11 @@ After further testing (v2 attenuated both voices in overlapping sections), the f
 7. ~~**Retrain classifier + GMM**~~ ✅ Done (2026-05-22) — N_FEATURES 44→56
 8. ~~**Train MaskNet**~~ ✅ Done (2026-05-22) — val_loss=0.147, desktop GPU
 9. ~~**Evaluate MaskNet**~~ ✅ Done (2026-05-22) — SI-SDR +3.945 dB, aurally confirmed → **v0.2.0**
+10. ~~**DPCRN + GRUSmoother + FiLM + SI-SDR loss**~~ ✅ Done (2026-05-24) — v0.2.1 code complete
+11. ~~**DSP improvements**~~ ✅ Done (2026-05-27) — Griffin-Lim, NMF K=16, Gaussian IRM smoothing
+12. ~~**Retrain all models on GPU**~~ ✅ Done (2026-05-27) — MaskNet −2.99 dB, DPCRN −3.54 dB SI-SDR
+13. ~~**Evaluate v0.3.0**~~ ✅ Done (2026-05-28) — SI-SDR +8.11 dB, PESQ +0.190, STOI +0.161 → **v0.3.0**
+14. ~~**Remove GRUSmoother**~~ ✅ Done (2026-05-28) — no improvement over HMM confirmed
 
 ### Completed (2026-05-22)
 
@@ -222,14 +227,12 @@ After further testing (v2 attenuated both voices in overlapping sections), the f
 
 ### v0.2.1 — Code complete (2026-05-24 committed, bugs fixed 2026-05-26)
 
-> **v0.3.0 will be tagged only after metric validation on a trained model.**
-
 | # | Task | Status | Notes |
 |---|---|---|---|
-| 1 | **SI-SDR loss for MaskNet/DPCRN** | ✅ Code done | `train_mask_net.py`: loss `combined` (default) = 0.7×neg_SI-SDR + 0.3×MSE. `torch.istft` differentiable in loop. |
-| 2 | **FiLM gender conditioning on MaskNet** | ✅ Code done | `mask_net.py`: `_FiLMBlock` + `nn.Embedding(2,16)`. ~82K params (was ~75K). `MaskNet.refine(…, gender=0)`. |
-| 3 | **GRU smoother (replaces HMM)** | ✅ Code done | `smoothing_gru.py`: BiGRU ~26K params. `train_smoothing.py`: BCE on IBM sequences. `attention.py`: auto-selects GRU if loaded. |
-| 4 | **DPCRN architecture** | ✅ Code done | `dpcrn.py`: 8 DualPath blocks (freq Conv2d + time GRU), ~302K params. Drop-in for MaskNet. `--model-type dpcrn` in `train_mask_net.py`. `--dpcrn` in `pipeline.py`. |
+| 1 | **SI-SDR loss for MaskNet/DPCRN** | ✅ Done | `train_mask_net.py`: loss `combined` (default) = 0.7×neg_SI-SDR + 0.3×MSE. `torch.istft` differentiable in loop. |
+| 2 | **FiLM gender conditioning on MaskNet** | ✅ Done | `mask_net.py`: `_FiLMBlock` + `nn.Embedding(2,16)`. ~82K params (was ~75K). `MaskNet.refine(…, gender=0)`. |
+| 3 | **DPCRN architecture** | ✅ Done | `dpcrn.py`: 8 DualPath blocks (freq Conv2d + time GRU), ~302K params. Drop-in for MaskNet. `--model-type dpcrn` in `train_mask_net.py`. `--dpcrn` in `pipeline.py`. |
+| 4 | ~~**GRU smoother**~~ | ❌ Removed | Trained (BiGRU ~26K params, BCE), no improvement over HMM. `smoothing_gru.py` e `train_smoothing.py` eliminati (2026-05-28). |
 
 **Bugs fixed (2026-05-26, smoke tests on Mac MPS):**
 - `train_smoothing.py` — `raw_mask` (float64) cast to float32 before tensor creation; MPS rejects float64.
@@ -248,9 +251,11 @@ All models retrained with new loss and architecture:
 
 | Model | Params | Best val_loss | Device | Notes |
 |---|---|---|---|---|
-| GRUSmoother | 26K | 0.538 (BCE) | CUDA | Epoch 18/30 |
 | MaskNet | 82K | −2.99 dB SI-SDR | CUDA | Epoch 45/50, combined loss + FiLM |
 | DPCRN | 302K | −3.54 dB SI-SDR | CUDA | Epoch 36/50, combined loss, batch=2, clip=2s |
+
+> GRUSmoother (26K, BCE val_loss 0.538) was trained but removed after evaluation confirmed no
+> improvement over the fixed 2-state HMM in any tested configuration. See cleanup below.
 
 ---
 
@@ -288,6 +293,8 @@ All models retrained with new loss and architecture:
 - Rimosse `separate()`, `compute_ratio_mask()`, `apply_mask()` da `separation.py` (dead code, supersedute da NMF)
 - Script di ricerca spostati in `scripts/`
 - `demo.py` aggiornato con pipeline completo (DPCRN con fallback su MaskNet)
+- `smoothing_gru.py` e `train_smoothing.py` rimossi: GRUSmoother addestrato ma senza miglioramento rispetto all'HMM — rimosso per mantenere il codebase pulito e rappresentativo della pipeline effettiva
+- Riferimenti rimossi da `attention.py`, `pipeline.py`, `CLAUDE.md`
 
 **Extended evaluation — 36 samples, SNR in {-3, 0, +3} dB, seed=123 (MLP + GMM + HMM + DPCRN):**
 
@@ -301,6 +308,18 @@ All models retrained with new loss and architecture:
 Mix baseline: PESQ 1.162 / STOI 0.723. System delta: PESQ **+0.136** / STOI **+0.034**.
 
 Note: std ≈ 3.7 dB reflects speaker diversity in LibriSpeech dev-clean, not instability — per-sample deltas are consistently positive at −3 and 0 dB; some regressions at +3 dB where the male voice is quieter and the system occasionally over-suppresses it.
+
+---
+
+## Future Work (post v0.3.0)
+
+| Priority | Task | Notes |
+|---|---|---|
+| 🟡 Medium | **FastICA pre-separation** | Applicare ICA prima dell'estrazione feature per dare al classificatore input più puliti. Identificato in v0.2.0, mai implementato. Utilità sul mono da verificare sperimentalmente. |
+| 🟡 Medium | **WSJ0-mix / LibriMix benchmark** | Confronto formale con baseline pubblicati per posizionare il sistema nel panorama accademico. |
+| 🔵 Low | **N-speaker extension** | Sostituire il criterio binario M/F con un speaker embedding (d-vector/x-vector) da un clip di enrollment. Richiede rework del FiLM conditioning in DPCRN e dataset multi-speaker. |
+
+---
 
 ### Research: candidate improvements to MaskNet / separation stage (2026-05-23)
 
