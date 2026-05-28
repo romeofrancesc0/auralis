@@ -26,10 +26,8 @@ class AttentionModule:
     distribution of each gender — complementary to the MLP's discriminative output
     which is trained on mixed frames with IBM labels.
 
-    Smoothing (smooth=True, default):
-      - If a GRUSmoother is provided, uses the learned GRU temporal smoother.
-      - Otherwise falls back to the 2-state HMM (forward-backward).
-    Both options enforce temporal coherence and reduce mask choppiness.
+    Smoothing (smooth=True, default): 2-state HMM forward-backward enforces
+    temporal coherence and reduces mask choppiness.
     """
 
     def __init__(
@@ -37,12 +35,10 @@ class AttentionModule:
         classifier: SpeakerClassifier,
         gmm=None,
         gmm_weight: float = GMM_WEIGHT,
-        gru_smoother=None,
     ) -> None:
-        self.classifier   = classifier
-        self.gmm          = gmm
-        self.gmm_weight   = gmm_weight
-        self.gru_smoother = gru_smoother  # optional GRUSmoother instance
+        self.classifier = classifier
+        self.gmm        = gmm
+        self.gmm_weight = gmm_weight
 
     def compute_mask(
         self,
@@ -55,7 +51,7 @@ class AttentionModule:
         Args:
             audio:  mono waveform of the mixture, shape (n_samples,)
             sr:     sample rate
-            smooth: if True, apply temporal smoothing (GRU if available, else HMM)
+            smooth: if True, apply HMM temporal smoothing
 
         Returns:
             mask: shape (n_frames,), values in [0, 1]
@@ -77,11 +73,8 @@ class AttentionModule:
             mask = (1.0 - self.gmm_weight) * mask[:n] + self.gmm_weight * gmm_proba[:n]
 
         if smooth:
-            if self.gru_smoother is not None:
-                mask = self.gru_smoother.smooth(mask)
-            else:
-                from src.ai.smoothing import hmm_smooth
-                mask = hmm_smooth(mask)
+            from src.ai.smoothing import hmm_smooth
+            mask = hmm_smooth(mask)
 
         return mask
 
