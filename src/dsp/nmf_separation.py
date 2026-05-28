@@ -20,6 +20,7 @@ from scipy.ndimage import gaussian_filter
 from sklearn.decomposition import NMF
 
 if TYPE_CHECKING:
+    from src.ai.dpcrn import DPCRN
     from src.ai.mask_net import MaskNet
 
 logger = logging.getLogger(__name__)
@@ -272,7 +273,7 @@ def separate_nmf(
     n_components: int = N_COMPONENTS,
     component_sharpening: float = 3.0,
     refine_with_pitch: bool = True,
-    mask_net: "MaskNet | None" = None,
+    mask_net: "MaskNet | DPCRN | None" = None,
     target_gender: int = 0,
     griffin_lim_iters: int = GRIFFIN_LIM_ITERS,
 ) -> np.ndarray:
