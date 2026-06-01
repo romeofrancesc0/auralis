@@ -7,6 +7,14 @@ Recommended usage (best perceptual quality — MLP + GMM + HMM + DPCRN):
         --dpcrn models/dpcrn.pt \\
         --output out.wav
 
+Isolate the male speaker instead:
+    python -m src.pipeline --input mix.wav \\
+        --model models/classifier.joblib \\
+        --gmm   models/gender_gmm.joblib \\
+        --dpcrn models/dpcrn.pt \\
+        --target male \\
+        --output out_male.wav
+
 Experimental alternatives (research / ablation only):
     # MaskNet instead of DPCRN (lighter, slightly lower quality)
     python -m src.pipeline --input mix.wav \\
@@ -36,6 +44,7 @@ def run(
     mask_net_path: str | None = None,
     dpcrn_path: str | None = None,
     sr: int = SAMPLE_RATE,
+    target: str = "female",
 ) -> None:
     logger.info("Loading audio: %s", input_path)
     audio, sr = load_audio(input_path, sr=sr)
@@ -66,14 +75,16 @@ def run(
     logger.info("Computing attention mask...")
     mask = attention.compute_mask(audio, sr=sr)
 
+    target_gender = 0 if target == "female" else 1
+
     refiner_label = ""
     if dpcrn_path:
         refiner_label = " + DPCRN"
     elif mask_net_path:
         refiner_label = " + MaskNet"
 
-    logger.info("Separating target speaker (NMF%s)...", refiner_label)
-    reconstructed = separate_nmf(audio, mask, sr=sr, mask_net=mask_net, target_gender=0)
+    logger.info("Separating target speaker: %s (NMF%s)...", target.upper(), refiner_label)
+    reconstructed = separate_nmf(audio, mask, sr=sr, mask_net=mask_net, target_gender=target_gender)
 
     logger.info("Enhancing reconstructed signal...")
     output = enhance(reconstructed, sr=sr)
@@ -100,6 +111,8 @@ def main() -> None:
                       help="Path to trained GenderGMM (.joblib). Recommended.")
     main.add_argument("--dpcrn", default=None,
                       help="Path to trained DPCRN (.pt). Recommended CNN refiner (best perceptual quality).")
+    main.add_argument("--target", choices=["female", "male"], default="female",
+                      help="Speaker to isolate: 'female' (default) or 'male'.")
     main.add_argument("--sr", type=int, default=SAMPLE_RATE,
                       help="Sample rate (default 16000).")
 
@@ -121,6 +134,7 @@ def main() -> None:
         mask_net_path=args.mask_net,
         dpcrn_path=args.dpcrn,
         sr=args.sr,
+        target=args.target,
     )
 
 

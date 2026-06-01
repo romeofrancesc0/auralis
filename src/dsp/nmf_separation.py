@@ -97,25 +97,27 @@ def _build_irm(
     n_components: int,
     component_sharpening: float,
     refine_with_pitch: bool,
+    target_gender: int = 0,
 ) -> np.ndarray:
     """Compute the NMF-guided IRM from a pre-computed STFT.
 
     Implements steps 1–5 of the separation pipeline:
         1. NMF decomposition of the magnitude spectrogram
         2. Component scoring via attention weights
-        3. Per-bin IRM from female/male NMF reconstructions
+        3. Per-bin IRM from target/non-target NMF reconstructions
         4. Hybrid blend: IRM = 0.75 * attention + 0.25 * NMF-IRM
-        5. Pitch mask refinement (harmonic floor + male suppression + IRM floor)
+        5. Pitch mask refinement (harmonic floor + interferer suppression + IRM floor)
 
     Args:
         stft:               complex STFT, shape (n_freqs, n_frames_stft)
         magnitude:          |stft|, shape (n_freqs, n_frames_stft)
-        attention_weights:  per-frame F probability, shape (n_frames,)
+        attention_weights:  per-frame F probability from classifier, shape (n_frames,)
         audio:              raw waveform — required for pYIN pitch detection
         sr:                 sample rate
         n_components:       number of NMF components K
         component_sharpening: sigmoid steepness for component score mapping
-        refine_with_pitch:  if True, apply harmonic floor + male suppression
+        refine_with_pitch:  if True, apply harmonic floor + interferer suppression
+        target_gender:      0=Female (default), 1=Male — inverts all masking logic
 
     Returns:
         irm: shape (n_freqs, n_frames), values in [0, 1]
@@ -144,23 +146,26 @@ def _build_irm(
     W = W / col_max[np.newaxis, :]
     H = H * col_max[:, np.newaxis]
 
-    raw_scores = _score_components(H, attention_weights)
-    female_weights = 0.05 + 0.90 * sharpen_mask(raw_scores, power=component_sharpening)
+    # Invert attention for male target so component scoring reflects "maleness"
+    effective_attention = attention_weights if target_gender == 0 else 1.0 - attention_weights
+
+    raw_scores = _score_components(H, effective_attention)
+    target_weights = 0.05 + 0.90 * sharpen_mask(raw_scores, power=component_sharpening)
 
     n_frames = min(H.shape[1], n_frames_stft)
     H = H[:, :n_frames]
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=RuntimeWarning)
-        V_female = W @ (female_weights[:, np.newaxis] * H)
-        V_male   = W @ ((1.0 - female_weights)[:, np.newaxis] * H)
+        V_target     = W @ (target_weights[:, np.newaxis] * H)
+        V_non_target = W @ ((1.0 - target_weights)[:, np.newaxis] * H)
 
     eps = 1e-8
-    irm_nmf = V_female / (V_female + V_male + eps)
+    irm_nmf = V_target / (V_target + V_non_target + eps)
 
-    n_frames_attn = min(len(attention_weights), n_frames)
+    n_frames_attn = min(len(effective_attention), n_frames)
     attn_col = np.pad(
-        attention_weights[:n_frames_attn].astype(np.float32),
+        effective_attention[:n_frames_attn].astype(np.float32),
         (0, n_frames - n_frames_attn),
         constant_values=0.5,
     )
@@ -179,24 +184,40 @@ def _build_irm(
                  int((irm > 0.6).mean() * 100),
                  int((irm < 0.4).mean() * 100))
 
-    male_suppressed_bins = np.zeros(irm.shape, dtype=bool)
+    suppressed_bins = np.zeros(irm.shape, dtype=bool)
 
     if refine_with_pitch:
-        _, harmonic_bins = compute_pitch_mask(
-            audio, sr=sr, n_fft=N_FFT, hop_length=HOP_LENGTH,
-        )
-        harmonic_bins = harmonic_bins[:, :n_frames]
-        irm = np.where(harmonic_bins, np.maximum(irm, HARMONIC_FLOOR), irm)
+        if target_gender == 0:
+            # Female target: boost female harmonics, suppress male harmonics
+            _, harmonic_bins = compute_pitch_mask(
+                audio, sr=sr, n_fft=N_FFT, hop_length=HOP_LENGTH,
+            )
+            harmonic_bins = harmonic_bins[:, :n_frames]
+            irm = np.where(harmonic_bins, np.maximum(irm, HARMONIC_FLOOR), irm)
 
-        male_mask = compute_male_suppression_mask(
-            audio, sr=sr, n_fft=N_FFT, hop_length=HOP_LENGTH,
-        )
-        male_harmonic_bins = male_mask[:, :n_frames] < 0.5
-        irm = np.where(male_harmonic_bins, np.minimum(irm, MALE_SUPPRESSION), irm)
-        male_suppressed_bins = male_harmonic_bins
+            male_mask = compute_male_suppression_mask(
+                audio, sr=sr, n_fft=N_FFT, hop_length=HOP_LENGTH,
+            )
+            male_harmonic_bins = male_mask[:, :n_frames] < 0.5
+            irm = np.where(male_harmonic_bins, np.minimum(irm, MALE_SUPPRESSION), irm)
+            suppressed_bins = male_harmonic_bins
+        else:
+            # Male target: boost male harmonics, suppress female harmonics
+            male_mask = compute_male_suppression_mask(
+                audio, sr=sr, n_fft=N_FFT, hop_length=HOP_LENGTH,
+            )
+            male_harmonic_bins = male_mask[:, :n_frames] < 0.5
+            irm = np.where(male_harmonic_bins, np.maximum(irm, HARMONIC_FLOOR), irm)
 
-    if float(attention_weights.mean()) >= 0.25:
-        irm = np.where(~male_suppressed_bins, np.maximum(irm, IRM_FLOOR), irm)
+            _, female_harmonic_bins = compute_pitch_mask(
+                audio, sr=sr, n_fft=N_FFT, hop_length=HOP_LENGTH,
+            )
+            female_harmonic_bins = female_harmonic_bins[:, :n_frames]
+            irm = np.where(female_harmonic_bins, np.minimum(irm, MALE_SUPPRESSION), irm)
+            suppressed_bins = female_harmonic_bins
+
+    if float(effective_attention.mean()) >= 0.25:
+        irm = np.where(~suppressed_bins, np.maximum(irm, IRM_FLOOR), irm)
 
     return irm
 
@@ -238,6 +259,7 @@ def compute_nmf_irm(
     n_components: int = N_COMPONENTS,
     component_sharpening: float = 3.0,
     refine_with_pitch: bool = True,
+    target_gender: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute the NMF-guided IRM and the STFT magnitude spectrogram.
 
@@ -261,6 +283,7 @@ def compute_nmf_irm(
     irm = _build_irm(
         stft, magnitude, attention_weights, audio,
         sr, n_components, component_sharpening, refine_with_pitch,
+        target_gender,
     )
     n_frames = irm.shape[1]
     return irm, magnitude[:, :n_frames]
@@ -306,6 +329,7 @@ def separate_nmf(
     irm = _build_irm(
         stft, magnitude, attention_weights, audio,
         sr, n_components, component_sharpening, refine_with_pitch,
+        target_gender,
     )
 
     if mask_net is not None:

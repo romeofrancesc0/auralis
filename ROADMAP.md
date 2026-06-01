@@ -216,6 +216,9 @@ After further testing (v2 attenuated both voices in overlapping sections), the f
 12. ~~**Retrain all models on GPU**~~ ✅ Done (2026-05-27) — MaskNet −2.99 dB, DPCRN −3.54 dB SI-SDR
 13. ~~**Evaluate v0.3.0**~~ ✅ Done (2026-05-28) — SI-SDR +8.11 dB, PESQ +0.190, STOI +0.161 → **v0.3.0**
 14. ~~**Remove GRUSmoother**~~ ✅ Done (2026-05-28) — no improvement over HMM confirmed
+15. ~~**`--target {female,male}` symmetric separation**~~ ✅ Done (2026-06-01) — logic inversion in `_build_irm()`, 3 new tests (33 total)
+16. ~~**Dynamic mixing for DPCRN/MaskNet training**~~ ✅ Done (2026-06-01) — `_DynamicMixingDataset` in `train_mask_net.py`; fresh M/F pair + random SNR + random clip offset per step; fixed val set; `--no-dynamic-mixing` flag for retrocompat
+17. ~~**Dual-gender training for DPCRN**~~ ✅ Done (2026-06-01) — `target_gender` casuale per sample in `_DynamicMixingDataset`; IRM target, attention effettiva e waveform target invertiti per male samples; `compute_nmf_irm()` esposto con `target_gender`; gender propagato nel loop di training per MaskNet FiLM
 
 ### Completed (2026-05-22)
 
@@ -315,6 +318,7 @@ Note: std ≈ 3.7 dB reflects speaker diversity in LibriSpeech dev-clean, not in
 
 | Priority | Task | Notes |
 |---|---|---|
+| 🟡 Medium | **Retrain DPCRN with dynamic mixing** | Run `train_mask_net.py --model-type dpcrn` on GPU desktop with new dynamic mixing default. Requires GPU. |
 | 🟡 Medium | **FastICA pre-separation** | Applicare ICA prima dell'estrazione feature per dare al classificatore input più puliti. Identificato in v0.2.0, mai implementato. Utilità sul mono da verificare sperimentalmente. |
 | 🟡 Medium | **WSJ0-mix / LibriMix benchmark** | Confronto formale con baseline pubblicati per posizionare il sistema nel panorama accademico. |
 | 🔵 Low | **N-speaker extension** | Sostituire il criterio binario M/F con un speaker embedding (d-vector/x-vector) da un clip di enrollment. Richiede rework del FiLM conditioning in DPCRN e dataset multi-speaker. |

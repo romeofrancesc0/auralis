@@ -5,8 +5,12 @@ outputs as input, supervised against the ideal IRM computed from clean sources:
 
     IRM_target(f, t) = |F(f,t)|² / (|F(f,t)|² + |M(f,t)|² + ε)
 
-Training data is generated on-the-fly from LibriSpeech, reusing the same
-make_samples() utility used for MLP training.
+Dynamic mixing (default):
+  Each sample is generated fresh at every __getitem__ call: a random F/M speaker
+  pair is selected, a random segment is taken from each clip, and a random SNR is
+  drawn from the SNR list.  This means the model sees a unique mixture at every
+  step of every epoch, dramatically increasing effective training set diversity
+  without downloading additional data.
 
 Loss options:
   mse      — Mean-squared error on the IRM (original, per-bin)
@@ -14,7 +18,7 @@ Loss options:
   combined — 0.7 * neg_SI-SDR + 0.3 * MSE (default — metric-aligned + stable)
 
 Usage:
-    # Minimal (MaskNet, combined loss):
+    # Minimal (MaskNet, combined loss, dynamic mixing):
     python -m src.ai.train_mask_net
 
     # DPCRN with combined loss:
@@ -30,16 +34,21 @@ Usage:
         --batch-size 8 \\
         --loss combined \\
         --out models/mask_net.pt
+
+    # Disable dynamic mixing (legacy static dataset):
+    python -m src.ai.train_mask_net --no-dynamic-mixing
 """
 from __future__ import annotations
 
 import argparse
 import logging
+import random
 from pathlib import Path
 
 import numpy as np
 
 from src.dsp.stft import HOP_LENGTH, N_FFT
+from src.utils import SAMPLE_RATE
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +141,129 @@ def _pad_or_trim(arr: np.ndarray, n_frames: int) -> np.ndarray:
         return arr[..., :n_frames]
     pad_width = [(0, 0)] * (arr.ndim - 1) + [(0, n_frames - t)]
     return np.pad(arr, pad_width, mode="constant")
+
+
+def _load_random_segment(
+    rng: random.Random,
+    audio_files: list[Path],
+    n_samples: int,
+    sr: int,
+) -> np.ndarray:
+    """Load a random segment from a random file in audio_files.
+
+    Unlike _load_clip (which always reads from the start), this function picks
+    a uniformly random start offset so that the same audio file can yield many
+    distinct training clips.
+    """
+    from src.utils import load_audio
+    path = rng.choice(audio_files)
+    audio, _ = load_audio(path, sr=sr)
+    if len(audio) <= n_samples:
+        return np.pad(audio, (0, n_samples - len(audio)))
+    start = rng.randint(0, len(audio) - n_samples)
+    return audio[start : start + n_samples]
+
+
+class _DynamicMixingDataset:
+    """PyTorch Dataset that generates a fresh M/F mixture on every __getitem__ call.
+
+    Each call independently samples:
+      - a random female speaker from the index
+      - a random male speaker from the index
+      - a random SNR value from snr_db_list
+      - a random clip segment from each speaker's audio files
+
+    This means every epoch exposes the model to a different set of mixtures,
+    multiplying effective training data by the number of possible combinations
+    of speaker pairs, clip offsets, and SNR values.
+
+    num_workers=0 is required (default in train()) because the sklearn NMF
+    object inside compute_nmf_irm() and the attention module are not safe
+    to share across forked worker processes.
+    """
+
+    def __init__(
+        self,
+        female_speakers: list,
+        male_speakers: list,
+        attention_module,
+        snr_db_list: list[float],
+        n_per_epoch: int,
+        clip_duration: float,
+        sr: int,
+    ) -> None:
+        self.female_speakers = female_speakers
+        self.male_speakers   = male_speakers
+        self.attention_module = attention_module
+        self.snr_db_list = snr_db_list
+        self.n_per_epoch = n_per_epoch
+        self.n_clip = int(sr * clip_duration)
+        self.sr = sr
+
+    def __len__(self) -> int:
+        return self.n_per_epoch
+
+    def __getitem__(self, idx: int):
+        import torch
+        from src.ai.mask_net import build_input
+        from src.dsp.nmf_separation import compute_nmf_irm
+        from src.dsp.stft import compute_stft
+        from src.utils import make_mixture
+
+        # System-entropy seed — different result each call, even for the same idx
+        rng = random.Random()
+
+        female = rng.choice(self.female_speakers)
+        male   = rng.choice(self.male_speakers)
+        snr    = rng.choice(self.snr_db_list)
+        # Randomly target female (0) or male (1) so DPCRN learns to refine both
+        target_gender = rng.choice([0, 1])
+
+        f_audio = _load_random_segment(rng, female.audio_files, self.n_clip, self.sr)
+        m_audio = _load_random_segment(rng, male.audio_files,   self.n_clip, self.sr)
+
+        mix = make_mixture(f_audio, m_audio, snr_db=snr)
+
+        stft      = compute_stft(mix)
+        magnitude = np.abs(stft)
+        attn      = self.attention_module.compute_mask(mix, sr=self.sr, smooth=True)
+
+        # NMF IRM and target IRM depend on who we're isolating this step
+        nmf_irm, _ = compute_nmf_irm(mix, attn, sr=self.sr, target_gender=target_gender)
+        female_irm  = _compute_target_irm(f_audio, m_audio)
+        target_irm  = female_irm if target_gender == 0 else (1.0 - female_irm)
+
+        # Effective attention: P(female) for female target, P(male)=1-P(female) for male
+        effective_attn = attn if target_gender == 0 else 1.0 - attn
+
+        # Target waveform: the voice we want to isolate this step
+        tgt_wav_src = f_audio if target_gender == 0 else m_audio
+
+        mag_f  = _pad_or_trim(magnitude,  FIXED_FRAMES)
+        irm_f  = _pad_or_trim(nmf_irm,    FIXED_FRAMES)
+        tgt_f  = _pad_or_trim(target_irm, FIXED_FRAMES)
+        stft_f = _pad_or_trim(stft,       FIXED_FRAMES)
+
+        n_attn = min(len(effective_attn), FIXED_FRAMES)
+        attn_f = np.zeros(FIXED_FRAMES, dtype=np.float32)
+        attn_f[:n_attn] = effective_attn[:n_attn].astype(np.float32)
+
+        n_samp = len(tgt_wav_src)
+        if n_samp >= FIXED_SAMPLES:
+            tgt_wav_f = tgt_wav_src[:FIXED_SAMPLES].astype(np.float32)
+        else:
+            tgt_wav_f = np.pad(tgt_wav_src, (0, FIXED_SAMPLES - n_samp)).astype(np.float32)
+
+        x = build_input(mag_f.astype(np.float32), attn_f, irm_f.astype(np.float32))
+
+        return (
+            torch.from_numpy(x),
+            torch.from_numpy(tgt_f.astype(np.float32)),
+            torch.from_numpy(stft_f.real.astype(np.float32)),
+            torch.from_numpy(stft_f.imag.astype(np.float32)),
+            torch.from_numpy(tgt_wav_f),
+            torch.tensor(target_gender, dtype=torch.long),
+        )
 
 
 def build_dataset(
@@ -230,6 +362,7 @@ def train(
     device: str | None,
     loss_type: str,
     model_type: str,
+    dynamic_mixing: bool = True,
 ) -> None:
     try:
         import torch
@@ -245,37 +378,102 @@ def train(
     # ------------------------------------------------------------------ #
     # Dataset                                                              #
     # ------------------------------------------------------------------ #
-    raw_items = build_dataset(
-        classifier_path, gmm_path, n_samples, snr_db_list, clip_duration,
-    )
+    if dynamic_mixing:
+        from src.ai.attention import AttentionModule
+        from src.ai.classifier import SpeakerClassifier
+        from src.dsp.dataset import load_speaker_index
 
-    class _Dataset(Dataset):
-        def __init__(self, items: list) -> None:
-            self.items = items
+        logger.info("Dynamic mixing enabled — fresh mixes generated each step.")
 
-        def __len__(self) -> int:
-            return len(self.items)
+        classifier = SpeakerClassifier.load(classifier_path)
+        gmm = None
+        if gmm_path:
+            from src.ai.gmm_classifier import GenderGMM
+            gmm = GenderGMM.load(gmm_path)
+        attention_module = AttentionModule(classifier, gmm=gmm)
 
-        def __getitem__(self, idx: int):
-            mag, attn, irm, target_irm, stft_r, stft_i, tgt_wav = self.items[idx]
-            x = build_input(mag, attn, irm)   # (3, F, FIXED_FRAMES)
-            return (
-                torch.from_numpy(x),
-                torch.from_numpy(target_irm),         # (F, FIXED_FRAMES)
-                torch.from_numpy(stft_r),             # (F, FIXED_FRAMES)
-                torch.from_numpy(stft_i),             # (F, FIXED_FRAMES)
-                torch.from_numpy(tgt_wav),            # (FIXED_SAMPLES,)
-            )
+        index = load_speaker_index()
+        female_speakers = index["F"]
+        male_speakers   = index["M"]
 
-    n_val = max(1, len(raw_items) // 10)
-    val_items, train_items = raw_items[:n_val], raw_items[n_val:]
+        n_per_epoch = n_samples * len(snr_db_list)
 
-    train_loader = DataLoader(_Dataset(train_items), batch_size=batch_size, shuffle=True)
-    val_loader   = DataLoader(_Dataset(val_items),   batch_size=batch_size, shuffle=False)
-    logger.info(
-        "Train: %d samples  |  Val: %d samples  |  Batch size: %d",
-        len(train_items), len(val_items), batch_size,
-    )
+        train_dataset = _DynamicMixingDataset(
+            female_speakers=female_speakers,
+            male_speakers=male_speakers,
+            attention_module=attention_module,
+            snr_db_list=snr_db_list,
+            n_per_epoch=n_per_epoch,
+            clip_duration=clip_duration,
+            sr=SAMPLE_RATE,
+        )
+
+        # Fixed small validation set for a reproducible loss curve
+        n_val = max(4, n_samples // 5)
+        logger.info("Building fixed val set (%d samples)...", n_val)
+        val_raw = build_dataset(classifier_path, gmm_path, n_val, snr_db_list[:1], clip_duration)
+
+        class _StaticDataset(Dataset):
+            def __init__(self, items: list) -> None:
+                self.items = items
+
+            def __len__(self) -> int:
+                return len(self.items)
+
+            def __getitem__(self, idx: int):
+                mag, attn, irm, target_irm, stft_r, stft_i, tgt_wav = self.items[idx]
+                x = build_input(mag, attn, irm)
+                return (
+                    torch.from_numpy(x),
+                    torch.from_numpy(target_irm),
+                    torch.from_numpy(stft_r),
+                    torch.from_numpy(stft_i),
+                    torch.from_numpy(tgt_wav),
+                    torch.tensor(0, dtype=torch.long),   # val set always female
+                )
+
+        # num_workers=0: NMF and sklearn models are not safe across forked workers
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+        val_loader   = DataLoader(_StaticDataset(val_raw), batch_size=batch_size, shuffle=False)
+        logger.info(
+            "Train: %d samples/epoch (dynamic)  |  Val: %d samples (fixed)  |  Batch: %d",
+            n_per_epoch, len(val_raw), batch_size,
+        )
+
+    else:
+        # ---- Legacy static dataset ----------------------------------------
+        raw_items = build_dataset(
+            classifier_path, gmm_path, n_samples, snr_db_list, clip_duration,
+        )
+
+        class _StaticDataset(Dataset):  # type: ignore[no-redef]
+            def __init__(self, items: list) -> None:
+                self.items = items
+
+            def __len__(self) -> int:
+                return len(self.items)
+
+            def __getitem__(self, idx: int):
+                mag, attn, irm, target_irm, stft_r, stft_i, tgt_wav = self.items[idx]
+                x = build_input(mag, attn, irm)
+                return (
+                    torch.from_numpy(x),
+                    torch.from_numpy(target_irm),
+                    torch.from_numpy(stft_r),
+                    torch.from_numpy(stft_i),
+                    torch.from_numpy(tgt_wav),
+                    torch.tensor(0, dtype=torch.long),   # static dataset always female
+                )
+
+        n_val = max(1, len(raw_items) // 10)
+        val_items, train_items = raw_items[:n_val], raw_items[n_val:]
+
+        train_loader = DataLoader(_StaticDataset(train_items), batch_size=batch_size, shuffle=True)
+        val_loader   = DataLoader(_StaticDataset(val_items),   batch_size=batch_size, shuffle=False)
+        logger.info(
+            "Train: %d samples  |  Val: %d samples  |  Batch size: %d",
+            len(train_items), len(val_items), batch_size,
+        )
 
     # ------------------------------------------------------------------ #
     # Model, optimizer, scheduler                                          #
@@ -295,9 +493,6 @@ def train(
     optimizer = torch.optim.Adam(model_obj.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    # Gender tensor — always 0 (female target) for current pipeline
-    _FEMALE = torch.zeros(batch_size, dtype=torch.long)
-
     use_sisdr = loss_type in ("sisdr", "combined")
     sisdr_weight = 0.7 if loss_type == "combined" else 1.0
     mse_weight   = 0.3 if loss_type == "combined" else 0.0
@@ -313,17 +508,16 @@ def train(
         model_obj.train()
         train_loss = 0.0
 
-        for x, y_irm, stft_r, stft_i, tgt_wav in train_loader:
+        for x, y_irm, stft_r, stft_i, tgt_wav, gender_b in train_loader:
             x, y_irm = x.to(dev), y_irm.to(dev)
             stft_r, stft_i, tgt_wav = stft_r.to(dev), stft_i.to(dev), tgt_wav.to(dev)
-            B = x.shape[0]
+            gender_t = gender_b.to(dev)
 
             optimizer.zero_grad()
 
             if model_type == "dpcrn":
                 pred_mask = model_obj(x)
             else:
-                gender_t = _FEMALE[:B].to(dev)
                 pred_mask = model_obj(x, gender_t)
 
             loss = torch.tensor(0.0, device=dev)
@@ -342,15 +536,14 @@ def train(
         model_obj.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for x, y_irm, stft_r, stft_i, tgt_wav in val_loader:
+            for x, y_irm, stft_r, stft_i, tgt_wav, gender_b in val_loader:
                 x, y_irm = x.to(dev), y_irm.to(dev)
                 stft_r, stft_i, tgt_wav = stft_r.to(dev), stft_i.to(dev), tgt_wav.to(dev)
-                B = x.shape[0]
+                gender_t = gender_b.to(dev)
 
                 if model_type == "dpcrn":
                     pred_mask = model_obj(x)
                 else:
-                    gender_t = _FEMALE[:B].to(dev)
                     pred_mask = model_obj(x, gender_t)
 
                 v = torch.tensor(0.0, device=dev)
@@ -439,6 +632,13 @@ def main() -> None:
         "--out", default="models/mask_net.pt",
         help="Output path for the saved model. Default: models/mask_net.pt.",
     )
+    parser.add_argument(
+        "--no-dynamic-mixing", action="store_true", default=False,
+        help=(
+            "Disable dynamic mixing and use a fixed pre-generated dataset (legacy behaviour). "
+            "Dynamic mixing is the default and produces better generalisation."
+        ),
+    )
     args = parser.parse_args()
 
     train(
@@ -454,6 +654,7 @@ def main() -> None:
         device=args.device,
         loss_type=args.loss,
         model_type=args.model_type,
+        dynamic_mixing=not args.no_dynamic_mixing,
     )
 
 
