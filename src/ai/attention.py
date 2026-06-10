@@ -45,16 +45,20 @@ class AttentionModule:
         audio: np.ndarray,
         sr: int = SAMPLE_RATE,
         smooth: bool = True,
+        target_gender: int = 0,
     ) -> np.ndarray:
-        """Return per-frame attention weights for the target (F) speaker.
+        """Return per-frame attention weights for the target speaker.
 
         Args:
-            audio:  mono waveform of the mixture, shape (n_samples,)
-            sr:     sample rate
-            smooth: if True, apply HMM temporal smoothing
+            audio:         mono waveform of the mixture, shape (n_samples,)
+            sr:            sample rate
+            smooth:        if True, apply HMM temporal smoothing
+            target_gender: 0=Female (default), 1=Male. When 1, the mask is
+                           inverted before HMM smoothing so the HMM temporal
+                           bias operates in the correct direction for male targets.
 
         Returns:
-            mask: shape (n_frames,), values in [0, 1]
+            mask: shape (n_frames,), values in [0, 1] — P(target frame)
         """
         if self.classifier.window_size > 1:
             X = extract_windowed(audio, sr=sr, window_size=self.classifier.window_size)
@@ -62,7 +66,7 @@ class AttentionModule:
             X = extract_all(audio, sr=sr).T      # (n_frames, N_FEATURES)
 
         proba = self.classifier.predict_framewise(X)   # (n_frames, 2)
-        mask = proba[:, TARGET_CLASS_IDX]              # (n_frames,)
+        mask = proba[:, TARGET_CLASS_IDX]              # (n_frames,) — P(female)
 
         if self.gmm is not None:
             # GMM uses flat N_FEATURES-dim features, not the windowed representation.
@@ -71,6 +75,12 @@ class AttentionModule:
             gmm_proba = self.gmm.score_proba(X_flat)   # (n_frames,)
             n = min(len(mask), len(gmm_proba))
             mask = (1.0 - self.gmm_weight) * mask[:n] + self.gmm_weight * gmm_proba[:n]
+
+        # Invert before HMM so temporal smoothing biases toward the correct target.
+        # hmm_smooth(1-P(female)) gives P(male) with male-biased inertia,
+        # which is symmetric to hmm_smooth(P(female)) for the female case.
+        if target_gender == 1:
+            mask = 1.0 - mask
 
         if smooth:
             from src.ai.smoothing import hmm_smooth

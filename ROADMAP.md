@@ -314,11 +314,51 @@ Note: std ≈ 3.7 dB reflects speaker diversity in LibriSpeech dev-clean, not in
 
 ---
 
-## Future Work (post v0.3.0)
+## Session 2026-06-10 — DPCRN retraining + male target fix
+
+### DPCRN retrained (dynamic mixing + dual-gender)
+
+Models retrained on GPU desktop (RTX 5070, CUDA):
+- `classifier.joblib` — retrained (accuracy 0.972 on test set, 596K frames)
+- `gender_gmm.joblib` — retrained
+- `dpcrn.pt` — retrained with dynamic mixing + dual-gender targets
+
+**Female target evaluation — 36 samples, SNR in {-3, 0, +3} dB, seed=123:**
+
+| SNR | SI-SDR mix | SI-SDR out | Delta | PESQ out | STOI out |
+|-----|-----------|-----------|-------|----------|----------|
+| −3 dB | −3.02±0.12 | +1.51±3.44 | **+4.52±3.42** | 1.216±0.075 | 0.728±0.064 |
+| 0 dB  | −0.01±0.08 | +3.51±3.61 | **+3.53±3.59** | 1.320±0.129 | 0.770±0.064 |
+| +3 dB | +2.99±0.06 | +5.02±3.70 | **+2.03±3.69** | 1.450±0.189 | 0.800±0.059 |
+| **ALL** | −0.01±2.45 | **+3.35±3.86** | **+3.36±3.71** | **1.328±0.169** | **0.766±0.069** |
+
+Mix baseline: PESQ 1.162 / STOI 0.723. System delta: PESQ **+0.167** / STOI **+0.043**.
+Improvement over v0.3.0: SI-SDR +0.46 dB, PESQ +0.031, STOI +0.009 — all positive.
+
+### Architectural fix — male target (`AttentionModule.compute_mask`)
+
+**Root cause identified:** `compute_mask` always returned HMM-smoothed P(female) with female-biased
+transitions (p_ff=0.95, p_mf=0.20). The inversion `1 - mask` happened in `_build_irm` AFTER the HMM,
+so the temporal bias operated in the wrong direction for male targets.
+
+**Fix (2026-06-10):** added `target_gender: int = 0` param to `compute_mask()`. When `target_gender=1`,
+the mask is inverted to P(male) BEFORE `hmm_smooth`, so the HMM inertia biases toward male-dominant
+frames symmetrically. `_build_irm` uses `effective_attention = attention_weights` unconditionally
+(no post-HMM inversion).
+
+Files changed: `src/ai/attention.py`, `src/dsp/nmf_separation.py`, `src/ai/train_mask_net.py`,
+`src/pipeline.py`, `scripts/evaluate_extended_male.py`.
+
+**Male target evaluation before fix:** SI-SDR delta −13.32 dB (catastrophic — HMM pushing against target).
+**Male target evaluation after fix (same DPCRN, not yet retrained):** SI-SDR delta −9.12 dB (+4.2 dB improvement).
+Remaining gap due to DPCRN trained on old distribution — requires retraining with fixed pipeline.
+
+### Next tasks (priority order)
 
 | Priority | Task | Notes |
 |---|---|---|
-| 🟡 Medium | **Retrain DPCRN with dynamic mixing** | Run `train_mask_net.py --model-type dpcrn` on GPU desktop with new dynamic mixing default. Requires GPU. |
+| 🔴 High | **Retrain DPCRN with fixed pipeline** | `train_mask_net.py --model-type dpcrn --batch-size 2 --clip-duration 2.0` on GPU desktop. Training loop now calls `compute_mask(target_gender=target_gender)` correctly. |
+| 🔴 High | **Evaluate F + M targets, tag v0.4.0** | Run `evaluate_extended.py` + `evaluate_extended_male.py`. If both show positive delta → tag v0.4.0. |
 | 🟡 Medium | **FastICA pre-separation** | Applicare ICA prima dell'estrazione feature per dare al classificatore input più puliti. Identificato in v0.2.0, mai implementato. Utilità sul mono da verificare sperimentalmente. |
 | 🟡 Medium | **WSJ0-mix / LibriMix benchmark** | Confronto formale con baseline pubblicati per posizionare il sistema nel panorama accademico. |
 | 🔵 Low | **N-speaker extension** | Sostituire il criterio binario M/F con un speaker embedding (d-vector/x-vector) da un clip di enrollment. Richiede rework del FiLM conditioning in DPCRN e dataset multi-speaker. |

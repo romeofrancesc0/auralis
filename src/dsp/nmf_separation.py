@@ -146,8 +146,9 @@ def _build_irm(
     W = W / col_max[np.newaxis, :]
     H = H * col_max[:, np.newaxis]
 
-    # Invert attention for male target so component scoring reflects "maleness"
-    effective_attention = attention_weights if target_gender == 0 else 1.0 - attention_weights
+    # attention_weights already represents P(target): P(female) for gender=0,
+    # P(male) for gender=1 (inverted before HMM in AttentionModule.compute_mask).
+    effective_attention = attention_weights
 
     raw_scores = _score_components(H, effective_attention)
     target_weights = 0.05 + 0.90 * sharpen_mask(raw_scores, power=component_sharpening)

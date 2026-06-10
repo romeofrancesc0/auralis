@@ -72,10 +72,10 @@ def run(
 
     attention = AttentionModule(classifier, gmm=gmm)
 
-    logger.info("Computing attention mask...")
-    mask = attention.compute_mask(audio, sr=sr)
-
     target_gender = 0 if target == "female" else 1
+
+    logger.info("Computing attention mask...")
+    mask = attention.compute_mask(audio, sr=sr, target_gender=target_gender)
 
     refiner_label = ""
     if dpcrn_path:

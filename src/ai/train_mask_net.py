@@ -226,15 +226,16 @@ class _DynamicMixingDataset:
 
         stft      = compute_stft(mix)
         magnitude = np.abs(stft)
-        attn      = self.attention_module.compute_mask(mix, sr=self.sr, smooth=True)
+        # compute_mask returns P(target): P(female) for gender=0, P(male) for gender=1
+        attn = self.attention_module.compute_mask(mix, sr=self.sr, smooth=True,
+                                                  target_gender=target_gender)
 
         # NMF IRM and target IRM depend on who we're isolating this step
         nmf_irm, _ = compute_nmf_irm(mix, attn, sr=self.sr, target_gender=target_gender)
         female_irm  = _compute_target_irm(f_audio, m_audio)
         target_irm  = female_irm if target_gender == 0 else (1.0 - female_irm)
 
-        # Effective attention: P(female) for female target, P(male)=1-P(female) for male
-        effective_attn = attn if target_gender == 0 else 1.0 - attn
+        effective_attn = attn  # already P(target), no further inversion needed
 
         # Target waveform: the voice we want to isolate this step
         tgt_wav_src = f_audio if target_gender == 0 else m_audio
