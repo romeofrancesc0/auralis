@@ -191,6 +191,7 @@ class _DynamicMixingDataset:
         n_per_epoch: int,
         clip_duration: float,
         sr: int,
+        target_gender_mode: str = "both",
     ) -> None:
         self.female_speakers = female_speakers
         self.male_speakers   = male_speakers
@@ -199,6 +200,8 @@ class _DynamicMixingDataset:
         self.n_per_epoch = n_per_epoch
         self.n_clip = int(sr * clip_duration)
         self.sr = sr
+        # "female" → always target F, "male" → always target M, "both" → 50/50 random
+        self.target_gender_mode = target_gender_mode
 
     def __len__(self) -> int:
         return self.n_per_epoch
@@ -216,8 +219,12 @@ class _DynamicMixingDataset:
         female = rng.choice(self.female_speakers)
         male   = rng.choice(self.male_speakers)
         snr    = rng.choice(self.snr_db_list)
-        # Randomly target female (0) or male (1) so DPCRN learns to refine both
-        target_gender = rng.choice([0, 1])
+        if self.target_gender_mode == "female":
+            target_gender = 0
+        elif self.target_gender_mode == "male":
+            target_gender = 1
+        else:  # "both" — 50/50 random
+            target_gender = rng.choice([0, 1])
 
         f_audio = _load_random_segment(rng, female.audio_files, self.n_clip, self.sr)
         m_audio = _load_random_segment(rng, male.audio_files,   self.n_clip, self.sr)
@@ -364,6 +371,7 @@ def train(
     loss_type: str,
     model_type: str,
     dynamic_mixing: bool = True,
+    target_gender_mode: str = "female",
 ) -> None:
     try:
         import torch
@@ -407,6 +415,7 @@ def train(
             n_per_epoch=n_per_epoch,
             clip_duration=clip_duration,
             sr=SAMPLE_RATE,
+            target_gender_mode=target_gender_mode,
         )
 
         # Fixed small validation set for a reproducible loss curve
@@ -436,6 +445,7 @@ def train(
         # num_workers=0: NMF and sklearn models are not safe across forked workers
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
         val_loader   = DataLoader(_StaticDataset(val_raw), batch_size=batch_size, shuffle=False)
+        logger.info("Target gender mode: %s", target_gender_mode.upper())
         logger.info(
             "Train: %d samples/epoch (dynamic)  |  Val: %d samples (fixed)  |  Batch: %d",
             n_per_epoch, len(val_raw), batch_size,
@@ -640,6 +650,14 @@ def main() -> None:
             "Dynamic mixing is the default and produces better generalisation."
         ),
     )
+    parser.add_argument(
+        "--target-gender", choices=["female", "male", "both"], default="female",
+        help=(
+            "Target gender for training. 'female': all samples target F (default). "
+            "'male': all samples target M — use to train a dedicated male DPCRN. "
+            "'both': 50/50 random per sample (dual-gender, not recommended — see ROADMAP)."
+        ),
+    )
     args = parser.parse_args()
 
     train(
@@ -656,6 +674,7 @@ def main() -> None:
         loss_type=args.loss,
         model_type=args.model_type,
         dynamic_mixing=not args.no_dynamic_mixing,
+        target_gender_mode=args.target_gender,
     )
 
 
