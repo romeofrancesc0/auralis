@@ -160,3 +160,51 @@ def test_pipeline_missing_input_raises(classifier_path: str, tmp_path: Path) -> 
             model_path=classifier_path,
             output_path=output_path,
         )
+
+
+# ---------------------------------------------------------------------------
+# Male target
+# ---------------------------------------------------------------------------
+
+def test_pipeline_male_target_output_created(
+    classifier_path: str, mix_and_target: tuple, tmp_path: Path
+) -> None:
+    """Pipeline runs with target='male' without raising and creates the output file."""
+    mix_path, _ = mix_and_target
+    output_path = str(tmp_path / "output_male.wav")
+
+    run(input_path=mix_path, model_path=classifier_path, output_path=output_path, target="male")
+
+    assert Path(output_path).exists()
+
+
+def test_pipeline_male_target_output_length(
+    classifier_path: str, mix_and_target: tuple, tmp_path: Path
+) -> None:
+    """Male-target output length is within 5 % of the input length."""
+    mix_path, _ = mix_and_target
+    output_path = str(tmp_path / "output_male.wav")
+
+    run(input_path=mix_path, model_path=classifier_path, output_path=output_path, target="male")
+
+    mix_samples = int(_DURATION * SAMPLE_RATE)
+    output, _ = sf.read(output_path)
+    assert abs(len(output) - mix_samples) / mix_samples < 0.05
+
+
+def test_pipeline_male_female_outputs_differ(
+    classifier_path: str, mix_and_target: tuple, tmp_path: Path
+) -> None:
+    """Female and male target outputs are distinct signals (different masking applied)."""
+    mix_path, _ = mix_and_target
+    out_female = str(tmp_path / "out_female.wav")
+    out_male   = str(tmp_path / "out_male.wav")
+
+    run(input_path=mix_path, model_path=classifier_path, output_path=out_female, target="female")
+    run(input_path=mix_path, model_path=classifier_path, output_path=out_male,   target="male")
+
+    audio_f, _ = sf.read(out_female)
+    audio_m, _ = sf.read(out_male)
+    min_len = min(len(audio_f), len(audio_m))
+    # Outputs must not be identical — different masks produce different waveforms
+    assert not np.allclose(audio_f[:min_len], audio_m[:min_len])
