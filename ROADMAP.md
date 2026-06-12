@@ -355,13 +355,37 @@ Remaining gap due to DPCRN trained on old distribution — requires retraining w
 
 ### Next tasks (priority order)
 
-| Priority | Task | Notes |
-|---|---|---|
-| 🔴 High | **Retrain DPCRN with fixed pipeline** | `train_mask_net.py --model-type dpcrn --batch-size 2 --clip-duration 2.0` on GPU desktop. Training loop now calls `compute_mask(target_gender=target_gender)` correctly. |
-| 🔴 High | **Evaluate F + M targets, tag v0.4.0** | Run `evaluate_extended.py` + `evaluate_extended_male.py`. If both show positive delta → tag v0.4.0. |
-| 🟡 Medium | **FastICA pre-separation** | Applicare ICA prima dell'estrazione feature per dare al classificatore input più puliti. Identificato in v0.2.0, mai implementato. Utilità sul mono da verificare sperimentalmente. |
-| 🟡 Medium | **WSJ0-mix / LibriMix benchmark** | Confronto formale con baseline pubblicati per posizionare il sistema nel panorama accademico. |
-| 🔵 Low | **N-speaker extension** | Sostituire il criterio binario M/F con un speaker embedding (d-vector/x-vector) da un clip di enrollment. Richiede rework del FiLM conditioning in DPCRN e dataset multi-speaker. |
+| Priority | Task | Status | Notes |
+|---|---|---|---|
+| 🟡 In progress | **Train `dpcrn_male.pt`** | Epoch ~44 su GPU desktop Windows (RTX 5070) | train_loss=−5.54, val_loss=10.7 — gap alto, possibile overfitting. Controllare trend val_loss e usare best checkpoint. |
+| ⚠️ Da verificare | **Warning "increase X to >1000"** | Non identificato | Durante il training è apparso un warning che suggeriva di aumentare un valore >1000. Scrollare il log o usare `Tee-Object` al prossimo lancio per identificarlo. |
+| 🔴 High | **Evaluate `dpcrn_male.pt` (male target)** | Pending | Dopo training: `python scripts/evaluate_extended_male.py`. Verificare che lo script punti a `models/dpcrn_male.pt`. |
+| 🔴 High | **Evaluate `dpcrn.pt` (female target)** | Pending | `python scripts/evaluate_extended.py` per confermare che il modello female sia ancora stabile. |
+| 🔴 High | **Tag `v0.4.0`** | Pending | Solo se entrambi i target (F + M) mostrano SI-SDR delta positivo nella valutazione. |
+| 🟡 Medium | **FastICA pre-separation** | Not started | Applicare ICA prima dell'estrazione feature per dare al classificatore input più puliti. Identificato in v0.2.0, mai implementato. Utilità sul mono da verificare sperimentalmente. |
+| 🟡 Medium | **WSJ0-mix / LibriMix benchmark** | Not started | Confronto formale con baseline pubblicati per posizionare il sistema nel panorama accademico. |
+| 🔵 Low | **N-speaker extension** | Not started | Sostituire il criterio binario M/F con un speaker embedding (d-vector/x-vector) da un clip di enrollment. Richiede rework del FiLM conditioning in DPCRN e dataset multi-speaker. |
+
+---
+
+### Session 2026-06-11 — Training `dpcrn_male.pt` avviato
+
+**Comando eseguito sul desktop Windows (RTX 5070):**
+```powershell
+python -m src.ai.train_mask_net --model-type dpcrn --classifier models/classifier.joblib --gmm models/gender_gmm.joblib --n-samples 200 --loss combined --batch-size 2 --clip-duration 2.0 --target-gender male --out models/dpcrn_male.pt
+```
+
+**Stato osservato a epoch ~44:**
+- `train_loss = −5.54` — il modello impara a migliorare SI-SDR sul train set
+- `val_loss = 10.7` — gap elevato rispetto al train; la val_loss era in discesa o piatta/in risalita? Da verificare nel log.
+- `lr = 3.51e-05` — il LR scheduler ha già ridotto il LR, normale a questa epoch.
+
+**Warning non identificato:** messaggio che suggeriva di aumentare un valore a >1000. Training ha continuato, ma il warning va identificato nella sessione successiva.
+
+**Azione post-training:**
+1. Verificare che `models/dpcrn_male.pt` sia salvato correttamente
+2. Copiare il file sul Mac (o valutare direttamente sul desktop)
+3. Lanciare valutazione e confrontare con le metriche female di riferimento (+3.11 dB SI-SDR)
 
 ---
 
