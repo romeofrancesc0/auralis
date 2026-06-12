@@ -1,7 +1,7 @@
 # ROADMAP — Implementation Plan
 
-> **Status:** v0.3.0 tagged and released — SI-SDR +8.11 dB (demo), +6.33 dB avg over 10 samples. All metrics positive. GRUSmoother removed (trained but no improvement over HMM). Codebase clean.
-> **Last updated:** 2026-05-28.
+> **Status:** separate-then-select rework COMPLETE, pending listening check. DPCRNSeparator (~301K params, dual-output masks, uPIT neg-SI-SDR, dynamic mixing, held-out-speaker validation) + attention stream selection replaces the gender-mirrored classic flow. Extended eval (36 samples, seed=123): **F SI-SDRi +6.73 dB** (was +3.12), **M SI-SDRi +6.90 dB** (was −0.55); PESQ F 1.475 / M 1.505; STOI F 0.830 / M 0.842; stream-selection accuracy F 91.7% / M 100%. Log-MMSE enhancement degrades the separator output on all metrics → skipped in the separator pipeline flow. Classic NMF flow kept as the DSP baseline. Next: listening check (tag policy), then N-speaker extension (separator generalises to N masks + uPIT).
+> **Last updated:** 2026-06-12.
 
 This document tracks the full implementation plan. It must be consulted and updated at the start of each phase. Decisions taken move from the "Open questions" section into the body of the document.
 

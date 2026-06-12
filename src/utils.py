@@ -42,6 +42,24 @@ def make_mixture(
     voice_b is scaled so that SNR = 20*log10(rms_a / rms_b_scaled) = snr_db.
     The result is peak-normalized to [-1, 1] to prevent clipping.
     """
+    mixture, _, _ = make_mixture_with_sources(voice_a, voice_b, snr_db=snr_db)
+    return mixture
+
+
+def make_mixture_with_sources(
+    voice_a: np.ndarray,
+    voice_b: np.ndarray,
+    snr_db: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Like make_mixture, but also return the scaled sources.
+
+    The returned sources satisfy mixture == source_a + source_b exactly
+    (same SNR scaling and peak normalization applied), which is what
+    separation training objectives such as uPIT SI-SDR expect.
+
+    Returns:
+        (mixture, source_a, source_b) — all shape (min_len,)
+    """
     min_len = min(len(voice_a), len(voice_b))
     a = voice_a[:min_len].copy()
     b = voice_b[:min_len].copy()
@@ -57,4 +75,6 @@ def make_mixture(
     peak = np.max(np.abs(mixture))
     if peak > 0:
         mixture /= peak
-    return mixture
+        a /= peak
+        b /= peak
+    return mixture, a, b

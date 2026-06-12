@@ -180,6 +180,12 @@ python -m src.ai.train_mask_net \
     --gmm models/gender_gmm.joblib \
     --n-samples 200 \
     --out models/mask_net.pt
+
+# Stage 2 (alternative) — DPCRNSeparator, dual-output uPIT separation
+# (standalone: does NOT need stage 1 models in the training loop):
+python -m src.ai.train_separator \
+    --n-samples 200 --epochs 60 --batch-size 4 \
+    --out models/separator.pt
 ```
 
 ### End-to-end pipeline
@@ -198,6 +204,16 @@ python -m src.pipeline \
     --model models/classifier.joblib \
     --gmm models/gender_gmm.joblib \
     --mask-net models/mask_net.pt \
+    --output out.wav
+
+# Separate-then-select (uPIT separator + attentional stream selection;
+# works equally well for both genders via --target female / male):
+python -m src.pipeline \
+    --input mix.wav \
+    --model models/classifier.joblib \
+    --gmm models/gender_gmm.joblib \
+    --separator models/separator.pt \
+    --target male \
     --output out.wav
 ```
 

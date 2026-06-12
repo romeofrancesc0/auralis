@@ -32,9 +32,10 @@ SNR_LEVELS = [-3.0, 0.0, 3.0]
 CLIP_DURATION = 4.0
 SEED = 123
 
-CLASSIFIER_PATH = "models/classifier.joblib"
-GMM_PATH        = "models/gender_gmm.joblib"
-DPCRN_PATH      = "models/dpcrn.pt"
+CLASSIFIER_PATH  = "models/classifier.joblib"
+GMM_PATH         = "models/gender_gmm.joblib"
+DPCRN_MALE_PATH  = "models/dpcrn_male.pt"
+DPCRN_PATH       = "models/dpcrn.pt"
 
 
 def si_sdr(reference: np.ndarray, estimate: np.ndarray) -> float:
@@ -72,10 +73,12 @@ def main() -> None:
     log = logging.getLogger(__name__)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+    from pathlib import Path
+    dpcrn_path = DPCRN_MALE_PATH if Path(DPCRN_MALE_PATH).exists() else DPCRN_PATH
     log.info("Loading models...")
     classifier = SpeakerClassifier.load(CLASSIFIER_PATH)
     gmm        = GenderGMM.load(GMM_PATH)
-    dpcrn      = DPCRN.load(DPCRN_PATH)
+    dpcrn      = DPCRN.load(dpcrn_path)
     attention  = AttentionModule(classifier, gmm=gmm)
 
     snr_results: dict[float, dict[str, list[float]]] = {

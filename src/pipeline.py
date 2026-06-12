@@ -1,6 +1,14 @@
 """End-to-end pipeline: mixture -> isolated target speaker.
 
-Recommended usage (best perceptual quality — MLP + GMM + HMM + DPCRN):
+Separate-then-select flow (uPIT separator + attention stream selection):
+    python -m src.pipeline --input mix.wav \\
+        --model models/classifier.joblib \\
+        --gmm   models/gender_gmm.joblib \\
+        --separator models/separator.pt \\
+        --target male \\
+        --output out.wav
+
+Classic flow (MLP + GMM + HMM + NMF + DPCRN refiner):
     python -m src.pipeline --input mix.wav \\
         --model models/classifier.joblib \\
         --gmm   models/gender_gmm.joblib \\
@@ -43,6 +51,7 @@ def run(
     gmm_path: str | None = None,
     mask_net_path: str | None = None,
     dpcrn_path: str | None = None,
+    separator_path: str | None = None,
     sr: int = SAMPLE_RATE,
     target: str = "female",
 ) -> None:
@@ -58,33 +67,59 @@ def run(
         logger.info("Loading GenderGMM: %s", gmm_path)
         gmm = GenderGMM.load(gmm_path)
 
-    # mask_net and dpcrn share the same interface (refine / save / load)
-    # Only one is active at a time; --dpcrn takes precedence over --mask-net
-    mask_net = None
-    if dpcrn_path:
-        from src.ai.dpcrn import DPCRN
-        logger.info("Loading DPCRN: %s", dpcrn_path)
-        mask_net = DPCRN.load(dpcrn_path)
-    elif mask_net_path:
-        from src.ai.mask_net import MaskNet
-        logger.info("Loading MaskNet: %s", mask_net_path)
-        mask_net = MaskNet.load(mask_net_path)
-
     attention = AttentionModule(classifier, gmm=gmm)
-
     target_gender = 0 if target == "female" else 1
 
-    logger.info("Computing attention mask...")
-    mask = attention.compute_mask(audio, sr=sr, target_gender=target_gender)
+    if separator_path:
+        # Separate-then-select flow: the DPCRNSeparator segregates the scene
+        # into two streams (bottom-up), the attention module picks the target
+        # stream (top-down). Masks are applied to the complex mix STFT, so no
+        # Griffin-Lim pass is needed.
+        from src.ai.dpcrn import DPCRNSeparator
+        logger.info("Loading DPCRNSeparator: %s", separator_path)
+        separator = DPCRNSeparator.load(separator_path)
 
-    refiner_label = ""
-    if dpcrn_path:
-        refiner_label = " + DPCRN"
-    elif mask_net_path:
-        refiner_label = " + MaskNet"
+        logger.info("Separating both sources (uPIT separator)...")
+        streams = separator.separate(audio)
 
-    logger.info("Separating target speaker: %s (NMF%s)...", target.upper(), refiner_label)
-    reconstructed = separate_nmf(audio, mask, sr=sr, mask_net=mask_net, target_gender=target_gender)
+        logger.info("Selecting %s stream via attention...", target.upper())
+        reconstructed, confidence = attention.select_stream(
+            streams, target_gender=target_gender, sr=sr
+        )
+        logger.info("Stream selected (confidence %.3f)", confidence)
+
+        # Log-MMSE enhancement degrades the separator output on all metrics
+        # (evaluate_separator: raw SI-SDRi +6.7/+6.9 dB vs enhanced +4.9/+5.1)
+        # — the separator residual is speech-like, not stationary noise.
+        logger.info("Saving output: %s", output_path)
+        save_audio(output_path, reconstructed, sr=sr)
+        logger.info("Done.")
+        return
+    else:
+        # Classic flow: classifier-guided NMF masking + optional CNN refiner
+        # mask_net and dpcrn share the same interface (refine / save / load)
+        # Only one is active at a time; --dpcrn takes precedence over --mask-net
+        mask_net = None
+        if dpcrn_path:
+            from src.ai.dpcrn import DPCRN
+            logger.info("Loading DPCRN: %s", dpcrn_path)
+            mask_net = DPCRN.load(dpcrn_path)
+        elif mask_net_path:
+            from src.ai.mask_net import MaskNet
+            logger.info("Loading MaskNet: %s", mask_net_path)
+            mask_net = MaskNet.load(mask_net_path)
+
+        logger.info("Computing attention mask...")
+        mask = attention.compute_mask(audio, sr=sr, target_gender=target_gender)
+
+        refiner_label = ""
+        if dpcrn_path:
+            refiner_label = " + DPCRN"
+        elif mask_net_path:
+            refiner_label = " + MaskNet"
+
+        logger.info("Separating target speaker: %s (NMF%s)...", target.upper(), refiner_label)
+        reconstructed = separate_nmf(audio, mask, sr=sr, mask_net=mask_net, target_gender=target_gender)
 
     logger.info("Enhancing reconstructed signal...")
     output = enhance(reconstructed, sr=sr)
@@ -111,6 +146,9 @@ def main() -> None:
                       help="Path to trained GenderGMM (.joblib). Recommended.")
     main.add_argument("--dpcrn", default=None,
                       help="Path to trained DPCRN (.pt). Recommended CNN refiner (best perceptual quality).")
+    main.add_argument("--separator", default=None,
+                      help="Path to trained DPCRNSeparator (.pt). Separate-then-select flow; "
+                           "takes precedence over --dpcrn / --mask-net.")
     main.add_argument("--target", choices=["female", "male"], default="female",
                       help="Speaker to isolate: 'female' (default) or 'male'.")
     main.add_argument("--sr", type=int, default=SAMPLE_RATE,
@@ -133,6 +171,7 @@ def main() -> None:
         gmm_path=args.gmm,
         mask_net_path=args.mask_net,
         dpcrn_path=args.dpcrn,
+        separator_path=args.separator,
         sr=args.sr,
         target=args.target,
     )

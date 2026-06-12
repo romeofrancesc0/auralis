@@ -92,3 +92,51 @@ class AttentionModule:
         """Return the dominant gender in the audio clip ('M' or 'F')."""
         features = extract_all(audio, sr=sr)
         return self.classifier.predict(features)
+
+    def score_female(self, audio: np.ndarray, sr: int = SAMPLE_RATE) -> float:
+        """Mean P(female) over the clip — used to rank separated streams.
+
+        Frames with negligible energy are excluded: a separated stream is
+        mostly silence wherever the other speaker was active, and silent
+        frames would drag the score toward the classifier's 0.5 prior.
+        """
+        mask = self.compute_mask(audio, sr=sr, smooth=False, target_gender=0)
+
+        frame_length = 512
+        hop = 128
+        n_frames = len(mask)
+        rms = np.array([
+            np.sqrt(np.mean(audio[t * hop : t * hop + frame_length] ** 2))
+            for t in range(n_frames)
+        ])
+        active = rms > max(rms.max() * 0.1, 1e-6)
+        if active.sum() < 3:
+            return float(mask.mean())
+        return float(mask[active].mean())
+
+    def select_stream(
+        self,
+        streams: tuple[np.ndarray, np.ndarray],
+        target_gender: int,
+        sr: int = SAMPLE_RATE,
+    ) -> tuple[np.ndarray, float]:
+        """Pick the separated stream matching the target gender.
+
+        This is the top-down attentional selection step of the cocktail-party
+        model: the separator segregates the auditory scene bottom-up, and the
+        classifier-based attention decides which stream to attend to.
+
+        Args:
+            streams:       two separated waveforms (arbitrary permutation)
+            target_gender: 0=Female, 1=Male
+            sr:            sample rate
+
+        Returns:
+            (selected_stream, confidence) — confidence is |score_a − score_b|,
+            useful for diagnostics (near 0 = ambiguous selection).
+        """
+        score_a = self.score_female(streams[0], sr=sr)
+        score_b = self.score_female(streams[1], sr=sr)
+        a_is_target = score_a >= score_b if target_gender == 0 else score_a < score_b
+        selected = streams[0] if a_is_target else streams[1]
+        return selected, abs(score_a - score_b)

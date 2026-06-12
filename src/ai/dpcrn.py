@@ -112,6 +112,53 @@ try:
         def n_params(self) -> int:
             return sum(p.numel() for p in self.parameters())
 
+    class _DPCRNSeparator(nn.Module):
+        """DPCRN as a primary two-speaker separator (not a mask refiner).
+
+        Unlike _DPCRN, which refines a heuristic IRM and therefore needs the
+        attention/NMF channels, the separator sees only the normalised
+        log-magnitude spectrogram of the mixture and emits one mask per source.
+        Both masks are trained jointly with utterance-level permutation
+        invariant training (uPIT, Kolbæk et al. 2017), so neither output is
+        tied to a gender a priori — the attention module performs the
+        top-down stream selection afterwards (cocktail-party model:
+        bottom-up segregation, then attentional selection).
+        """
+
+        N_SOURCES = 2
+
+        def __init__(self, n_ch: int = N_CHANNELS, n_blocks: int = N_BLOCKS) -> None:
+            super().__init__()
+            self.encoder = nn.Sequential(
+                nn.Conv2d(1, n_ch, kernel_size=3, padding=1),
+                nn.BatchNorm2d(n_ch),
+                nn.ReLU(inplace=True),
+            )
+            self.blocks = nn.ModuleList(
+                [_DualPathBlock(n_ch) for _ in range(n_blocks)]
+            )
+            self.decoder = nn.Sequential(
+                nn.Conv2d(n_ch, self.N_SOURCES, kernel_size=1),
+                nn.Sigmoid(),
+            )
+
+        def forward(self, x: "torch.Tensor") -> "torch.Tensor":
+            """
+            Args:
+                x: (B, 1, F, T) normalised log-magnitude of the mixture
+
+            Returns:
+                (B, 2, F, T) one mask per source, values in [0, 1]
+            """
+            h = self.encoder(x)
+            for block in self.blocks:
+                h = block(h)
+            return self.decoder(h)
+
+        @property
+        def n_params(self) -> int:
+            return sum(p.numel() for p in self.parameters())
+
     _TORCH_AVAILABLE = True
 except ImportError:
     pass
@@ -194,4 +241,103 @@ class DPCRN:
         net._model.load_state_dict(state)
         net._model.eval()
         logger.info("DPCRN loaded from %s  (device: %s)", path, net._device)
+        return net
+
+
+# ----------------------------------------------------------------------
+# Separator: STFT helpers shared by training and inference
+# ----------------------------------------------------------------------
+# torch.stft/istft are used (instead of librosa) so masking and
+# reconstruction stay on the GPU and analysis/synthesis are guaranteed
+# to match between training and inference.
+
+def stft_torch(wav: "torch.Tensor") -> "torch.Tensor":
+    """Complex STFT, shape (B, F, T). Parameters match src.dsp.stft."""
+    from src.dsp.stft import HOP_LENGTH, N_FFT
+    window = torch.hann_window(N_FFT, device=wav.device)
+    return torch.stft(
+        wav, n_fft=N_FFT, hop_length=HOP_LENGTH, win_length=N_FFT,
+        window=window, center=True, return_complex=True,
+    )
+
+
+def istft_torch(stft: "torch.Tensor", length: int) -> "torch.Tensor":
+    """Inverse of stft_torch. Accepts (..., F, T), returns (..., length)."""
+    from src.dsp.stft import HOP_LENGTH, N_FFT
+    window = torch.hann_window(N_FFT, device=stft.device)
+    shape = stft.shape
+    flat = stft.reshape(-1, shape[-2], shape[-1])
+    wav = torch.istft(
+        flat, n_fft=N_FFT, hop_length=HOP_LENGTH, win_length=N_FFT,
+        window=window, center=True, length=length,
+    )
+    return wav.reshape(*shape[:-2], length)
+
+
+def normalize_log_mag(magnitude: "torch.Tensor", eps: float = 1e-8) -> "torch.Tensor":
+    """Per-utterance standardised log-magnitude: (log|X| − μ) / σ.
+
+    Args:
+        magnitude: (B, F, T)
+
+    Returns:
+        (B, 1, F, T) network-ready input
+    """
+    log_mag = torch.log(magnitude + eps)
+    mean = log_mag.mean(dim=(-2, -1), keepdim=True)
+    std = log_mag.std(dim=(-2, -1), keepdim=True)
+    return ((log_mag - mean) / (std + eps)).unsqueeze(1)
+
+
+class DPCRNSeparator:
+    """Inference wrapper around _DPCRNSeparator.
+
+    separate() returns BOTH estimated sources; which one is the target is
+    decided downstream by the attention module (top-down selection).
+    """
+
+    def __init__(self, device: str | None = None) -> None:
+        _check_torch()
+        self._device = device or _auto_device()
+        self._model = _DPCRNSeparator().to(self._device)
+        self._model.eval()
+        logger.debug(
+            "DPCRNSeparator ready on %s  (%d params)",
+            self._device, self._model.n_params,
+        )
+
+    def separate(self, audio: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Separate a 2-speaker mixture into two estimated source waveforms.
+
+        Masks are applied to the complex mix STFT (mix phase preserved),
+        so no Griffin-Lim pass is needed.
+
+        Args:
+            audio: mixture waveform, shape (n_samples,)
+
+        Returns:
+            (source_a, source_b) — each shape (n_samples,); permutation is
+            arbitrary, use the attention module to pick the target stream.
+        """
+        wav = torch.from_numpy(audio.astype(np.float32)).unsqueeze(0).to(self._device)
+        with torch.no_grad():
+            mix_stft = stft_torch(wav)                       # (1, F, T)
+            x = normalize_log_mag(mix_stft.abs())            # (1, 1, F, T)
+            masks = self._model(x)                           # (1, 2, F, T)
+            masked = mix_stft.unsqueeze(1) * masks           # (1, 2, F, T)
+            sources = istft_torch(masked, length=len(audio)) # (1, 2, n)
+        out = sources.squeeze(0).cpu().numpy()
+        return out[0], out[1]
+
+    def save(self, path: str | Path) -> None:
+        torch.save(self._model.state_dict(), path)
+        logger.info("DPCRNSeparator saved → %s", path)
+
+    @classmethod
+    def load(cls, path: str | Path, device: str | None = None) -> "DPCRNSeparator":
+        net = cls(device=device)
+        state = torch.load(path, map_location=net._device, weights_only=True)
+        net._model.load_state_dict(state)
+        net._model.eval()
+        logger.info("DPCRNSeparator loaded from %s  (device: %s)", path, net._device)
         return net
