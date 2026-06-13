@@ -1,7 +1,7 @@
 # ROADMAP — Implementation Plan
 
-> **Status:** separate-then-select rework COMPLETE, pending listening check. DPCRNSeparator (~301K params, dual-output masks, uPIT neg-SI-SDR, dynamic mixing, held-out-speaker validation) + attention stream selection replaces the gender-mirrored classic flow. Extended eval (36 samples, seed=123): **F SI-SDRi +6.73 dB** (was +3.12), **M SI-SDRi +6.90 dB** (was −0.55); PESQ F 1.475 / M 1.505; STOI F 0.830 / M 0.842; stream-selection accuracy F 91.7% / M 100%. Log-MMSE enhancement degrades the separator output on all metrics → skipped in the separator pipeline flow. Classic NMF flow kept as the DSP baseline. Next: listening check (tag policy), then N-speaker extension (separator generalises to N masks + uPIT).
-> **Last updated:** 2026-06-12.
+> **Status:** **v0.4.0 released** (tagged + pushed). Separate-then-select architecture: DPCRNSeparator (~301K params, dual-output masks, uPIT neg-SI-SDR, dynamic mixing, held-out-speaker validation) + attention stream selection replaces the gender-mirrored classic flow. Extended eval (36 samples, seed=123): **F SI-SDRi +6.73 dB** (was +3.12), **M SI-SDRi +6.90 dB** (was −0.55); PESQ F 1.475 / M 1.505; STOI F 0.830 / M 0.842; stream-selection accuracy F 91.7% / M 100%. Log-MMSE enhancement degrades the separator output on all metrics → skipped in the separator pipeline flow. Classic NMF flow kept as the DSP baseline. Next: N-speaker extension (separator generalises to N masks + uPIT).
+> **Last updated:** 2026-06-13.
 
 This document tracks the full implementation plan. It must be consulted and updated at the start of each phase. Decisions taken move from the "Open questions" section into the body of the document.
 
@@ -355,16 +355,16 @@ Remaining gap due to DPCRN trained on old distribution — requires retraining w
 
 ### Next tasks (priority order)
 
+> **Update 2026-06-13:** the dedicated `dpcrn_male.pt` line of work below was **abandoned**. The separate-then-select rework (a single dual-output `separator.pt` trained with uPIT + attention stream selection) solved the male target structurally — no gender-specific model is needed. v0.4.0 is tagged and released. See the status block at the top of this file.
+
 | Priority | Task | Status | Notes |
 |---|---|---|---|
-| 🟡 In progress | **Train `dpcrn_male.pt`** | Epoch ~44 su GPU desktop Windows (RTX 5070) | train_loss=−5.54, val_loss=10.7 — gap alto, possibile overfitting. Controllare trend val_loss e usare best checkpoint. |
-| ⚠️ Da verificare | **Warning "increase X to >1000"** | Non identificato | Durante il training è apparso un warning che suggeriva di aumentare un valore >1000. Scrollare il log o usare `Tee-Object` al prossimo lancio per identificarlo. |
-| 🔴 High | **Evaluate `dpcrn_male.pt` (male target)** | Pending | Dopo training: `python scripts/evaluate_extended_male.py`. Verificare che lo script punti a `models/dpcrn_male.pt`. |
-| 🔴 High | **Evaluate `dpcrn.pt` (female target)** | Pending | `python scripts/evaluate_extended.py` per confermare che il modello female sia ancora stabile. |
-| 🔴 High | **Tag `v0.4.0`** | Pending | Solo se entrambi i target (F + M) mostrano SI-SDR delta positivo nella valutazione. |
-| 🟡 Medium | **FastICA pre-separation** | Not started | Applicare ICA prima dell'estrazione feature per dare al classificatore input più puliti. Identificato in v0.2.0, mai implementato. Utilità sul mono da verificare sperimentalmente. |
-| 🟡 Medium | **WSJ0-mix / LibriMix benchmark** | Not started | Confronto formale con baseline pubblicati per posizionare il sistema nel panorama accademico. |
-| 🔵 Low | **N-speaker extension** | Not started | Sostituire il criterio binario M/F con un speaker embedding (d-vector/x-vector) da un clip di enrollment. Richiede rework del FiLM conditioning in DPCRN e dataset multi-speaker. |
+| ✅ Done | **Train + evaluate dual-output `separator.pt`** | Done (2026-06-12) | uPIT neg-SI-SDR, dynamic mixing, held-out-speaker val. Replaces `dpcrn.pt` / `dpcrn_male.pt` in the recommended flow. |
+| ✅ Done | **Tag `v0.4.0`** | Done | Both targets positive: F SI-SDRi +6.73 dB, M +6.90 dB; selection accuracy F 91.7% / M 100%. |
+| ❌ Abandoned | **Train / evaluate `dpcrn_male.pt`** | Superseded | Dedicated male model gave −0.55 dB SI-SDR; the separator handles both genders symmetrically. The unidentified ">1000" training warning is moot (that training path is retired). |
+| 🟡 Medium | **FastICA pre-separation** | Not started | Apply ICA before feature extraction to give the classifier cleaner input. Identified in v0.2.0, never implemented. Usefulness on mono to be verified experimentally. |
+| 🟡 Medium | **WSJ0-mix / LibriMix benchmark** | Not started | Formal comparison with published baselines to position the system academically. |
+| 🔵 Low | **N-speaker extension** | Not started | Replace the binary M/F criterion with a speaker embedding (d-vector/x-vector) from an enrollment clip. Requires reworking the DPCRN conditioning and a multi-speaker dataset. |
 
 ---
 
@@ -386,6 +386,8 @@ python -m src.ai.train_mask_net --model-type dpcrn --classifier models/classifie
 1. Verificare che `models/dpcrn_male.pt` sia salvato correttamente
 2. Copiare il file sul Mac (o valutare direttamente sul desktop)
 3. Lanciare valutazione e confrontare con le metriche female di riferimento (+3.11 dB SI-SDR)
+
+**Esito (2026-06-13):** questa linea di lavoro è stata abbandonata. Invece di mantenere un modello maschile dedicato, l'architettura è passata a un singolo `separator.pt` dual-output addestrato con uPIT (separate-then-select). `dpcrn_male.pt` non è più usato; la valutazione finale (`results_separator.txt`) dà F +6.73 dB e M +6.90 dB. Vedi il blocco di stato in cima al file.
 
 ---
 

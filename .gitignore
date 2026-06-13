@@ -23,3 +23,7 @@ CLAUDE.md
 TEMP.md
 RELEASE_*.md
 .claude/
+
+# Log di valutazione/training (scratch, rigenerabili — i numeri sono archiviati in ROADMAP.md)
+*.log
+results_*.txt
