@@ -1,7 +1,7 @@
 # ROADMAP — Implementation Plan
 
-> **Status:** **v0.4.0 released** (tagged + pushed). Separate-then-select architecture: DPCRNSeparator (~301K params, dual-output masks, uPIT neg-SI-SDR, dynamic mixing, held-out-speaker validation) + attention stream selection replaces the gender-mirrored classic flow. Extended eval (36 samples, seed=123): **F SI-SDRi +6.73 dB** (was +3.12), **M SI-SDRi +6.90 dB** (was −0.55); PESQ F 1.475 / M 1.505; STOI F 0.830 / M 0.842; stream-selection accuracy F 91.7% / M 100%. Log-MMSE enhancement degrades the separator output on all metrics → skipped in the separator pipeline flow. Classic NMF flow kept as the DSP baseline. Next: N-speaker extension (separator generalises to N masks + uPIT).
-> **Last updated:** 2026-06-13.
+> **Status:** **v0.4.0 released** (tagged + pushed). Separate-then-select architecture: DPCRNSeparator (~301K params, dual-output masks, uPIT neg-SI-SDR, dynamic mixing, held-out-speaker validation) + attention stream selection replaces the gender-mirrored classic flow. Extended eval (36 samples, seed=123): **F SI-SDRi +6.73 dB** (was +3.12), **M SI-SDRi +6.90 dB** (was −0.55); PESQ F 1.475 / M 1.505; STOI F 0.830 / M 0.842; stream-selection accuracy F 91.7% / M 100%. Log-MMSE enhancement degrades the separator output on all metrics → skipped in the separator pipeline flow. Classic NMF flow kept as the DSP baseline. **2026-06-14:** RIR reverb augmentation landed (`src/dsp/augment.py` + `--rir-dir`/`--rir-prob` in `train_separator.py`) for synthetic-to-real robustness — code complete, awaiting an RIR set + GPU training. Next: train `separator_robust.pt`; then N-speaker extension.
+> **Last updated:** 2026-06-14.
 
 This document tracks the full implementation plan. It must be consulted and updated at the start of each phase. Decisions taken move from the "Open questions" section into the body of the document.
 
@@ -365,6 +365,48 @@ Remaining gap due to DPCRN trained on old distribution — requires retraining w
 | 🟡 Medium | **FastICA pre-separation** | Not started | Apply ICA before feature extraction to give the classifier cleaner input. Identified in v0.2.0, never implemented. Usefulness on mono to be verified experimentally. |
 | 🟡 Medium | **WSJ0-mix / LibriMix benchmark** | Not started | Formal comparison with published baselines to position the system academically. |
 | 🔵 Low | **N-speaker extension** | Not started | Replace the binary M/F criterion with a speaker embedding (d-vector/x-vector) from an enrollment clip. Requires reworking the DPCRN conditioning and a multi-speaker dataset. |
+
+---
+
+## Session 2026-06-14 — RIR reverb augmentation (synthetic-to-real robustness)
+
+**Motivation:** the separator is trained on anechoic LibriSpeech mixtures, so it
+degrades on real recordings (room reverberation, the *synthetic-to-real gap*).
+Phase 1 adds optional reverb augmentation to close that gap without collecting
+real data — clean voices are convolved with measured/simulated RIRs before mixing.
+
+**Design decisions:**
+- **Reverberant targets, not dereverberation:** both the mixture input and the
+  uPIT targets are the reverberant sources, so the SI-SDR additivity invariant
+  `mix == src_f + src_m` holds and training stays stable.
+- **Mixed-condition (`--rir-prob 0.5`):** half the mixtures stay clean → no
+  regression on anechoic input while gaining real-world robustness.
+- **Held-out rooms:** RIRs split 80/20; validation reports SI-SDR on both a clean
+  set and a reverberant set built from unseen rooms. Checkpoint metric = mean of
+  the two, so a reverb gain cannot be bought by regressing on clean.
+- **Zero new dependencies:** convolution via `scipy.signal.fftconvolve`, loading
+  via `librosa` (both already required). Onset kept aligned to the RIR direct-path
+  so the reverberant target remains valid for SI-SDR.
+
+| File | Change |
+|---|---|
+| `src/dsp/augment.py` | New — `load_rir_index`, `split_rirs`, `load_rir` (cached), `apply_rir`, `reverberate_pair` |
+| `src/ai/train_separator.py` | `--rir-dir` / `--rir-prob` args; reverb applied in dynamic dataset + val; dual clean/reverb validation + combined checkpoint |
+| `tests/test_augment.py` | New — 8 tests (length preservation, identity impulse, additivity invariant, missing/empty index, deterministic split) |
+| `CLAUDE.md`, `README.md` | Documented module, command, RIR dataset download |
+
+**Status:** ✅ Code complete, 41/41 tests passing. **Pending:** download an RIR set
+into `data/raw/rir/`, train `separator_robust.pt` on the GPU desktop, evaluate on
+real audio, and confirm perceptually before tagging (do not overwrite `separator.pt`).
+
+**Next step after real-audio validation:** write the academic paper (~10 pages, LaTeX/Overleaf,
+IEEE style) documenting the techniques used — STFT, feature extraction (MFCC, LPC, pitch),
+NMF separation, log-MMSE enhancement, MLP+GMM+HMM attention, DPCRNSeparator with uPIT.
+Required submission for the "Analisi intelligente dei segnali" exam alongside the working software.
+
+**RIR datasets (recommended):** MIT Acoustical Reverberation Survey (small),
+OpenSLR28, BUT ReverbDB. Optional **Phase 2** (background noise via WHAM!/DNS) only
+if real audio proves noisy — deferred until Phase 1 is validated by listening.
 
 ---
 

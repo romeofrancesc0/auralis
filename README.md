@@ -188,6 +188,32 @@ python -m src.ai.train_separator \
     --out models/separator.pt
 ```
 
+#### Robustness training (reverberant — for real recordings)
+
+Models trained only on anechoic LibriSpeech mixtures degrade on real recordings,
+which always carry room reverberation (the *synthetic-to-real gap*). Reverb
+augmentation convolves the clean voices with **Room Impulse Responses (RIRs)**
+before mixing, so the separator learns to segregate sources in reverb without
+collecting any real data:
+
+```bash
+python -m src.ai.train_separator \
+    --n-samples 200 --epochs 60 --batch-size 4 \
+    --rir-dir data/raw/rir --rir-prob 0.5 \
+    --out models/separator_robust.pt
+```
+
+`--rir-prob 0.5` trains on a mix of clean and reverberant conditions, so the
+model stays accurate on anechoic input while gaining real-world robustness.
+Validation reports SI-SDR on both clean and reverberant (held-out rooms) sets.
+
+> **RIR datasets** (place `.wav`/`.flac` files under `data/raw/rir/`, any layout —
+> the loader globs recursively and resamples to 16 kHz):
+> [MIT Acoustical Reverberation](https://mcdermottlab.mit.edu/Reverb/IR_Survey.html) (small, easy start),
+> [OpenSLR28 RIRs](https://www.openslr.org/28/),
+> [BUT ReverbDB](https://speech.fit.vutbr.cz/software/but-speech-fit-reverb-database).
+> If the directory is missing or empty, training falls back to clean mixtures.
+
 ### End-to-end pipeline
 
 ```bash
@@ -239,6 +265,7 @@ auralis/
 │   │   ├── stft.py            # STFT / ISTFT (centralised parameters)
 │   │   ├── features.py        # 56-feature extraction per frame (MFCC, pitch, LPC, ...)
 │   │   ├── dataset.py         # LibriSpeech loader, M+F mixer, IBM dataset builder
+│   │   ├── augment.py         # RIR reverb augmentation (synthetic-to-real robustness)
 │   │   ├── enhancement.py     # Log-MMSE speech enhancement (Ephraim & Malah 1985)
 │   │   ├── separation.py      # T-F masking utilities (ratio mask, pitch mask)
 │   │   └── nmf_separation.py  # Primary separation module (classifier-guided NMF + MaskNet hook)

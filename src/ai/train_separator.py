@@ -61,13 +61,26 @@ def _make_mix_pair(
     snr_db_list: list[float],
     n_clip: int,
     sr: int,
+    rirs: list | None = None,
+    rir_prob: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Sample one (mix, source_f, source_m) triple."""
+    """Sample one (mix, source_f, source_m) triple.
+
+    When ``rirs`` is provided, the whole mixture is reverberated with
+    probability ``rir_prob`` (both sources convolved with independent RIRs) so
+    that the model sees a mix of clean and reverberant conditions and stays
+    robust on anechoic input. Reverb is applied to the dry voices *before*
+    mixing, so ``make_mixture_with_sources`` still returns reverberant targets
+    satisfying ``mix == src_f + src_m``.
+    """
     female = rng.choice(female_speakers)
     male   = rng.choice(male_speakers)
     snr    = rng.choice(snr_db_list)
     f_audio = _load_random_segment(rng, female.audio_files, n_clip, sr)
     m_audio = _load_random_segment(rng, male.audio_files, n_clip, sr)
+    if rirs and rng.random() < rir_prob:
+        from src.dsp.augment import reverberate_pair
+        f_audio, m_audio = reverberate_pair(f_audio, m_audio, rirs, rng, sr)
     return make_mixture_with_sources(f_audio, m_audio, snr_db=snr)
 
 
@@ -91,6 +104,8 @@ class _DynamicMixDataset:
         n_per_epoch: int,
         n_clip: int,
         sr: int,
+        rirs: list | None = None,
+        rir_prob: float = 0.0,
     ) -> None:
         self.female_speakers = female_speakers
         self.male_speakers = male_speakers
@@ -98,6 +113,8 @@ class _DynamicMixDataset:
         self.n_per_epoch = n_per_epoch
         self.n_clip = n_clip
         self.sr = sr
+        self.rirs = rirs
+        self.rir_prob = rir_prob
 
     def __len__(self) -> int:
         return self.n_per_epoch
@@ -108,6 +125,7 @@ class _DynamicMixDataset:
         mix, src_f, src_m = _make_mix_pair(
             rng, self.female_speakers, self.male_speakers,
             self.snr_db_list, self.n_clip, self.sr,
+            rirs=self.rirs, rir_prob=self.rir_prob,
         )
         return (
             torch.from_numpy(mix.astype(np.float32)),
@@ -179,6 +197,8 @@ def train(
     out: str,
     device: str | None,
     num_workers: int,
+    rir_dir: str | None = None,
+    rir_prob: float = 0.0,
 ) -> None:
     try:
         import torch
@@ -189,6 +209,7 @@ def train(
         ) from exc
 
     from src.ai.dpcrn import DPCRNSeparator
+    from src.dsp.augment import load_rir_index, split_rirs
     from src.dsp.dataset import load_speaker_index
 
     n_clip = int(SAMPLE_RATE * clip_duration)
@@ -201,9 +222,22 @@ def train(
         len(female_train), len(male_train), len(female_val), len(male_val),
     )
 
+    # RIR augmentation: split rooms train/val (held-out rooms for reverb val).
+    rirs = load_rir_index(rir_dir) if rir_dir else []
+    rir_train, rir_val = split_rirs(rirs) if rirs else ([], [])
+    if rirs and not rir_val:               # too few rooms to hold any out
+        rir_val = rir_train
+    use_reverb = bool(rir_train) and rir_prob > 0.0
+    if use_reverb:
+        logger.info(
+            "Reverb augmentation ON — rooms: %d train / %d val (held-out)  |  p=%.2f",
+            len(rir_train), len(rir_val), rir_prob,
+        )
+
     n_per_epoch = n_samples * len(snr_db_list)
     train_dataset = _DynamicMixDataset(
         female_train, male_train, snr_db_list, n_per_epoch, n_clip, SAMPLE_RATE,
+        rirs=rir_train, rir_prob=rir_prob,
     )
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=False,
@@ -211,20 +245,35 @@ def train(
         worker_init_fn=_worker_init if num_workers > 0 else None,
     )
 
-    # Fixed seeded validation set on held-out speakers
+    # Fixed seeded validation set(s) on held-out speakers.
     n_val = max(8, n_samples // 5)
-    val_rng = random.Random(VAL_SEED)
-    val_items = []
-    for _ in range(n_val):
-        mix, src_f, src_m = _make_mix_pair(
-            val_rng, female_val, male_val, snr_db_list, n_clip, SAMPLE_RATE,
+
+    def _build_val(rng: random.Random, rir_list: list, rprob: float) -> list:
+        items = []
+        for _ in range(n_val):
+            mix, src_f, src_m = _make_mix_pair(
+                rng, female_val, male_val, snr_db_list, n_clip, SAMPLE_RATE,
+                rirs=rir_list, rir_prob=rprob,
+            )
+            items.append((
+                torch.from_numpy(mix.astype(np.float32)),
+                torch.from_numpy(src_f.astype(np.float32)),
+                torch.from_numpy(src_m.astype(np.float32)),
+            ))
+        return items
+
+    # Clean val always present (anti-regression on anechoic input); reverb val
+    # only when augmentation is active, built on unseen rooms.
+    clean_loader = DataLoader(
+        _build_val(random.Random(VAL_SEED), [], 0.0),
+        batch_size=batch_size, shuffle=False,
+    )
+    reverb_loader = None
+    if use_reverb:
+        reverb_loader = DataLoader(
+            _build_val(random.Random(VAL_SEED + 1), rir_val, 1.0),
+            batch_size=batch_size, shuffle=False,
         )
-        val_items.append((
-            torch.from_numpy(mix.astype(np.float32)),
-            torch.from_numpy(src_f.astype(np.float32)),
-            torch.from_numpy(src_m.astype(np.float32)),
-        ))
-    val_loader = DataLoader(val_items, batch_size=batch_size, shuffle=False)
 
     separator = DPCRNSeparator(device=device)
     model = separator._model
@@ -235,10 +284,19 @@ def train(
         n_per_epoch, n_val, batch_size,
     )
 
-    # Mix-as-estimate baseline: val SI-SDR if the system did nothing
+    def _eval_loss(loader) -> float:
+        total = 0.0
+        with torch.no_grad():
+            for mix, src_f, src_m in loader:
+                mix, src_f, src_m = mix.to(dev), src_f.to(dev), src_m.to(dev)
+                preds = _forward_batch(model, mix)
+                total += _upit_loss(preds, src_f, src_m).item()
+        return total / len(loader)
+
+    # Mix-as-estimate baseline: clean-val SI-SDR if the system did nothing
     with torch.no_grad():
         base = []
-        for mix, src_f, src_m in val_loader:
+        for mix, src_f, src_m in clean_loader:
             mix, src_f, src_m = mix.to(dev), src_f.to(dev), src_m.to(dev)
             b = (_neg_si_sdr(mix, src_f) + _neg_si_sdr(mix, src_m)) / 2.0
             base.append(-b.mean().item())
@@ -267,30 +325,35 @@ def train(
         train_loss /= len(train_loader)
 
         model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for mix, src_f, src_m in val_loader:
-                mix, src_f, src_m = mix.to(dev), src_f.to(dev), src_m.to(dev)
-                preds = _forward_batch(model, mix)
-                val_loss += _upit_loss(preds, src_f, src_m).item()
-        val_loss /= len(val_loader)
-
-        scheduler.step()
-        logger.info(
-            "Epoch %3d/%d  train SI-SDR=%.2f dB  val SI-SDR=%.2f dB (SI-SDRi %+.2f)  lr=%.2e",
-            epoch, epochs, -train_loss, -val_loss, -val_loss - baseline_sisdr,
-            scheduler.get_last_lr()[0],
+        clean_val_loss = _eval_loss(clean_loader)
+        reverb_val_loss = _eval_loss(reverb_loader) if reverb_loader else None
+        # Checkpoint metric balances both domains when reverb val exists, so a
+        # gain in reverb cannot be bought by regressing on clean input.
+        val_score = (
+            (clean_val_loss + reverb_val_loss) / 2.0
+            if reverb_val_loss is not None else clean_val_loss
         )
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        scheduler.step()
+        if reverb_val_loss is not None:
+            logger.info(
+                "Epoch %3d/%d  train SI-SDR=%.2f  val(clean)=%.2f  val(reverb)=%.2f dB  lr=%.2e",
+                epoch, epochs, -train_loss, -clean_val_loss, -reverb_val_loss,
+                scheduler.get_last_lr()[0],
+            )
+        else:
+            logger.info(
+                "Epoch %3d/%d  train SI-SDR=%.2f dB  val SI-SDR=%.2f dB (SI-SDRi %+.2f)  lr=%.2e",
+                epoch, epochs, -train_loss, -clean_val_loss,
+                -clean_val_loss - baseline_sisdr, scheduler.get_last_lr()[0],
+            )
+
+        if val_score < best_val_loss:
+            best_val_loss = val_score
             separator.save(out_path)
             logger.info("  ↳ new best — checkpoint saved")
 
-    logger.info(
-        "Done. Best val SI-SDR=%.2f dB (SI-SDRi %+.2f)  →  %s",
-        -best_val_loss, -best_val_loss - baseline_sisdr, out_path,
-    )
+    logger.info("Done. Best val SI-SDR=%.2f dB  →  %s", -best_val_loss, out_path)
 
 
 def main() -> None:
@@ -337,6 +400,17 @@ def main() -> None:
         help="DataLoader workers. Default: 0 (safe on Windows).",
     )
     parser.add_argument(
+        "--rir-dir", default=None,
+        help="Directory of RIR files (.wav/.flac) for reverb augmentation. "
+             "If omitted, training uses clean mixtures only.",
+    )
+    parser.add_argument(
+        "--rir-prob", type=float, default=0.5,
+        help="Probability a mixture is reverberated when --rir-dir is set. "
+             "0.5 keeps the model robust on both clean and reverberant input. "
+             "Default: 0.5.",
+    )
+    parser.add_argument(
         "--out", default="models/separator.pt",
         help="Output path for the saved model. Default: models/separator.pt.",
     )
@@ -352,6 +426,8 @@ def main() -> None:
         out=args.out,
         device=args.device,
         num_workers=args.num_workers,
+        rir_dir=args.rir_dir,
+        rir_prob=args.rir_prob,
     )
 
 
