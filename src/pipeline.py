@@ -54,6 +54,8 @@ def run(
     separator_path: str | None = None,
     sr: int = SAMPLE_RATE,
     target: str = "female",
+    stream_select: str = "classifier",
+    vad_gate: bool = False,
 ) -> None:
     logger.info("Loading audio: %s", input_path)
     audio, sr = load_audio(input_path, sr=sr)
@@ -82,15 +84,20 @@ def run(
         logger.info("Separating both sources (uPIT separator)...")
         streams = separator.separate(audio)
 
-        logger.info("Selecting %s stream via attention...", target.upper())
+        logger.info("Selecting %s stream via attention (method=%s)...", target.upper(), stream_select)
         reconstructed, confidence = attention.select_stream(
-            streams, target_gender=target_gender, sr=sr
+            streams, target_gender=target_gender, sr=sr, method=stream_select
         )
         logger.info("Stream selected (confidence %.3f)", confidence)
 
         # Log-MMSE enhancement degrades the separator output on all metrics
         # (evaluate_separator: raw SI-SDRi +6.7/+6.9 dB vs enhanced +4.9/+5.1)
         # — the separator residual is speech-like, not stationary noise.
+        if vad_gate:
+            from src.dsp.enhancement import voice_activity_gate
+            logger.info("Applying VAD gate...")
+            reconstructed = voice_activity_gate(reconstructed, sr=sr)
+
         logger.info("Saving output: %s", output_path)
         save_audio(output_path, reconstructed, sr=sr)
         logger.info("Done.")
@@ -120,6 +127,11 @@ def run(
 
         logger.info("Separating target speaker: %s (NMF%s)...", target.upper(), refiner_label)
         reconstructed = separate_nmf(audio, mask, sr=sr, mask_net=mask_net, target_gender=target_gender)
+
+    if vad_gate:
+        from src.dsp.enhancement import voice_activity_gate
+        logger.info("Applying VAD gate...")
+        reconstructed = voice_activity_gate(reconstructed, sr=sr)
 
     logger.info("Enhancing reconstructed signal...")
     output = enhance(reconstructed, sr=sr)
@@ -151,8 +163,30 @@ def main() -> None:
                            "takes precedence over --dpcrn / --mask-net.")
     main.add_argument("--target", choices=["female", "male"], default="female",
                       help="Speaker to isolate: 'female' (default) or 'male'.")
+    main.add_argument(
+        "--stream-select",
+        choices=["classifier", "pitch"],
+        default="classifier",
+        dest="stream_select",
+        help=(
+            "Stream selection method (only used with --separator): "
+            "'classifier' uses MLP+GMM scores (default, trained on LibriSpeech); "
+            "'pitch' uses mean F0 comparison — language-agnostic, no trained model needed."
+        ),
+    )
     main.add_argument("--sr", type=int, default=SAMPLE_RATE,
                       help="Sample rate (default 16000).")
+    main.add_argument(
+        "--vad-gate",
+        action="store_true",
+        default=False,
+        dest="vad_gate",
+        help=(
+            "Apply a voice activity gate to the output: mutes inter-word silence "
+            "to suppress residual bleedthrough during target speaker pauses. "
+            "Useful for male target on real-world audio."
+        ),
+    )
 
     exp = parser.add_argument_group(
         "experimental options",
@@ -174,6 +208,8 @@ def main() -> None:
         separator_path=args.separator,
         sr=args.sr,
         target=args.target,
+        stream_select=args.stream_select,
+        vad_gate=args.vad_gate,
     )
 
 

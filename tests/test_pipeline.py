@@ -208,3 +208,94 @@ def test_pipeline_male_female_outputs_differ(
     min_len = min(len(audio_f), len(audio_m))
     # Outputs must not be identical — different masks produce different waveforms
     assert not np.allclose(audio_f[:min_len], audio_m[:min_len])
+
+
+# ---------------------------------------------------------------------------
+# Pitch-based stream selection
+# ---------------------------------------------------------------------------
+
+def test_mean_active_pitch_female_higher_than_male() -> None:
+    """A 250 Hz sine (female range) reports a higher mean pitch than 120 Hz (male range)."""
+    from src.ai.attention import _mean_active_pitch
+
+    female_stream = _sine(250.0)
+    male_stream   = _sine(120.0)
+    assert _mean_active_pitch(female_stream, SAMPLE_RATE) > _mean_active_pitch(male_stream, SAMPLE_RATE)
+
+
+def test_select_stream_pitch_selects_female(classifier_path: str) -> None:
+    """Pitch method selects the higher-F0 stream when target is female."""
+    from src.ai.attention import AttentionModule
+    from src.ai.classifier import SpeakerClassifier
+
+    attn = AttentionModule(SpeakerClassifier.load(classifier_path))
+    female_stream = _sine(250.0)
+    male_stream   = _sine(120.0)
+
+    selected, conf = attn.select_stream(
+        (female_stream, male_stream), target_gender=0, sr=SAMPLE_RATE, method="pitch"
+    )
+    assert np.allclose(selected, female_stream)
+    assert conf > 0.0
+
+
+def test_select_stream_pitch_selects_male(classifier_path: str) -> None:
+    """Pitch method selects the lower-F0 stream when target is male."""
+    from src.ai.attention import AttentionModule
+    from src.ai.classifier import SpeakerClassifier
+
+    attn = AttentionModule(SpeakerClassifier.load(classifier_path))
+    female_stream = _sine(250.0)
+    male_stream   = _sine(120.0)
+
+    selected, conf = attn.select_stream(
+        (female_stream, male_stream), target_gender=1, sr=SAMPLE_RATE, method="pitch"
+    )
+    assert np.allclose(selected, male_stream)
+    assert conf > 0.0
+
+
+# ---------------------------------------------------------------------------
+# VAD gate
+# ---------------------------------------------------------------------------
+
+def _speech_with_bleedthrough_pause(sr: int = SAMPLE_RATE) -> np.ndarray:
+    """0.5s speech (250 Hz) + 0.8s near-silence (120 Hz at −60 dB) + 0.5s speech."""
+    speech      = _sine(250.0, duration=0.5, sr=sr)
+    bleedthrough = _sine(120.0, duration=0.8, sr=sr) * 1e-3   # −60 dB relative to speech
+    speech2     = _sine(250.0, duration=0.5, sr=sr)
+    return np.concatenate([speech, bleedthrough, speech2]).astype(np.float32)
+
+
+def test_voice_activity_gate_attenuates_bleedthrough() -> None:
+    """Gate suppresses residual energy in the inter-word pause by at least 20 dB."""
+    from src.dsp.enhancement import voice_activity_gate
+
+    audio = _speech_with_bleedthrough_pause()
+    gated = voice_activity_gate(audio, sr=SAMPLE_RATE)
+
+    # Centre of silence region: 0.5s speech + hold(0.2s) + release(0.06s) → safe from ~0.8s
+    check_start = int(0.85 * SAMPLE_RATE)
+    check_end   = int(1.10 * SAMPLE_RATE)
+    rms_before = np.sqrt(np.mean(audio[check_start:check_end] ** 2))
+    rms_after  = np.sqrt(np.mean(gated[check_start:check_end] ** 2))
+    assert rms_after < rms_before * 0.1   # > 20 dB attenuation
+
+
+def test_voice_activity_gate_preserves_sustained_speech() -> None:
+    """Gate does not attenuate sustained active speech after the attack phase."""
+    from src.dsp.enhancement import voice_activity_gate
+
+    speech = _sine(250.0, duration=1.0)
+    gated  = voice_activity_gate(speech, sr=SAMPLE_RATE)
+
+    onset = int(0.05 * SAMPLE_RATE)   # skip first 50 ms (attack ramp)
+    assert np.allclose(gated[onset:], speech[onset:], atol=1e-3)
+
+
+def test_voice_activity_gate_empty_returns_empty() -> None:
+    """Gate returns an empty array unchanged."""
+    from src.dsp.enhancement import voice_activity_gate
+
+    result = voice_activity_gate(np.zeros(0, dtype=np.float32), sr=SAMPLE_RATE)
+    assert len(result) == 0

@@ -241,7 +241,25 @@ python -m src.pipeline \
     --separator models/separator.pt \
     --target male \
     --output out.wav
+
+# Language-agnostic stream selection (recommended for non-English / real-world audio):
+# --stream-select pitch uses mean F0 comparison instead of the trained MLP+GMM.
+python -m src.pipeline \
+    --input mix.wav \
+    --model models/classifier.joblib \
+    --gmm models/gender_gmm.joblib \
+    --separator models/separator.pt \
+    --target male \
+    --stream-select pitch \
+    --vad-gate \
+    --output out.wav
 ```
+
+> **`--stream-select pitch`** — selects the stream with lower (male) or higher (female) mean
+> fundamental frequency. No trained model required; works across languages.
+>
+> **`--vad-gate`** — applies a smooth amplitude gate that mutes inter-word silence in the
+> output, suppressing residual bleedthrough from the interfering speaker during pauses.
 
 ### Run tests
 
@@ -295,7 +313,7 @@ auralis/
 ├── tests/
 │   ├── test_utils.py
 │   ├── test_features.py
-│   └── test_pipeline.py       # End-to-end integration tests (30 tests total)
+│   └── test_pipeline.py       # End-to-end integration tests (47 tests total)
 └── docs/                      # Theoretical documentation
 ```
 

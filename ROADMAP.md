@@ -1,7 +1,7 @@
 # ROADMAP — Implementation Plan
 
-> **Status:** **v0.4.0 released** (tagged + pushed). Separate-then-select architecture: DPCRNSeparator (~301K params, dual-output masks, uPIT neg-SI-SDR, dynamic mixing, held-out-speaker validation) + attention stream selection replaces the gender-mirrored classic flow. Extended eval (36 samples, seed=123): **F SI-SDRi +6.73 dB** (was +3.12), **M SI-SDRi +6.90 dB** (was −0.55); PESQ F 1.475 / M 1.505; STOI F 0.830 / M 0.842; stream-selection accuracy F 91.7% / M 100%. Log-MMSE enhancement degrades the separator output on all metrics → skipped in the separator pipeline flow. Classic NMF flow kept as the DSP baseline. **2026-06-14:** RIR reverb augmentation landed (`src/dsp/augment.py` + `--rir-dir`/`--rir-prob` in `train_separator.py`) for synthetic-to-real robustness — code complete, awaiting an RIR set + GPU training. Next: train `separator_robust.pt`; then N-speaker extension.
-> **Last updated:** 2026-06-14.
+> **Status:** **v0.4.0 released** (tagged + pushed). Separate-then-select architecture: DPCRNSeparator (~301K params, dual-output masks, uPIT neg-SI-SDR, dynamic mixing, held-out-speaker validation) + attention stream selection replaces the gender-mirrored classic flow. Extended eval (36 samples, seed=123): **F SI-SDRi +6.73 dB** (was +3.12), **M SI-SDRi +6.90 dB** (was −0.55); PESQ F 1.475 / M 1.505; STOI F 0.830 / M 0.842; stream-selection accuracy F 91.7% / M 100%. **2026-06-15:** RIR augmentation trained (`separator_robust.pt`) — synthetic-to-real gap not closed yet (−0.63 dB on clean, similar on real audio; robotic artifacts remain). Git history cleaned (Co-Authored-By removed via filter-branch, force-pushed). **2026-06-16:** pitch-based stream selection added (`--stream-select pitch`) — language-agnostic alternative to MLP+GMM for real-world/non-English audio. Next: academic paper for exam, then N-speaker extension.
+> **Last updated:** 2026-06-16.
 
 This document tracks the full implementation plan. It must be consulted and updated at the start of each phase. Decisions taken move from the "Open questions" section into the body of the document.
 
@@ -362,7 +362,6 @@ Remaining gap due to DPCRN trained on old distribution — requires retraining w
 | ✅ Done | **Train + evaluate dual-output `separator.pt`** | Done (2026-06-12) | uPIT neg-SI-SDR, dynamic mixing, held-out-speaker val. Replaces `dpcrn.pt` / `dpcrn_male.pt` in the recommended flow. |
 | ✅ Done | **Tag `v0.4.0`** | Done | Both targets positive: F SI-SDRi +6.73 dB, M +6.90 dB; selection accuracy F 91.7% / M 100%. |
 | ❌ Abandoned | **Train / evaluate `dpcrn_male.pt`** | Superseded | Dedicated male model gave −0.55 dB SI-SDR; the separator handles both genders symmetrically. The unidentified ">1000" training warning is moot (that training path is retired). |
-| 🟡 Medium | **FastICA pre-separation** | Not started | Apply ICA before feature extraction to give the classifier cleaner input. Identified in v0.2.0, never implemented. Usefulness on mono to be verified experimentally. |
 | 🟡 Medium | **WSJ0-mix / LibriMix benchmark** | Not started | Formal comparison with published baselines to position the system academically. |
 | 🔵 Low | **N-speaker extension** | Not started | Replace the binary M/F criterion with a speaker embedding (d-vector/x-vector) from an enrollment clip. Requires reworking the DPCRN conditioning and a multi-speaker dataset. |
 
@@ -627,7 +626,6 @@ The following approaches were identified as potential fixes for the classifier b
 |---|---|---|---|---|
 | 1 | HMM smoothing | Uncertain frames / temporal incoherence | `hmmlearn` | ✅ Done |
 | 2 | GMM likelihood ratio | Weak M/F discrimination | `sklearn.mixture` | ✅ Done |
-| 3 | FastICA pre-separation | Noisy features fed to classifier | `sklearn.decomposition` | ⬜ Not started |
 
 ### 1 — HMM Smoothing on classifier output
 
@@ -635,7 +633,6 @@ A 2-state HMM (F-dominant / M-dominant) models frame transitions and resolves am
 
 - **Why it helps:** uncertain frames are resolved by temporal context, not by the single-frame probability alone.
 - **Integration point:** post-processing layer on top of `AttentionModule.compute_mask()` output, no change to existing architecture.
-- **To validate:** does the Viterbi path reduce the uncertain-frame rate below 56.9%? Does SI-SDR improve?
 
 ### 2 — GMM Likelihood Ratio for gender modeling
 
@@ -643,16 +640,6 @@ Train two GMMs (`GaussianMixture`) on clean male and female speech features sepa
 
 - **Why it helps:** GMMs capture the global timbral distribution of each gender, not just single-frame snapshots. Complementary to the MLP.
 - **Integration point:** `src/ai/classifier.py` or as a standalone `GenderGMM` module feeding into `attention.py`.
-- **To validate:** does adding the LLR feature improve IBM accuracy above 74.6%? Does F-recall exceed 67.2%?
-
-### 3 — FastICA pre-separation
-
-Apply `FastICA` before feature extraction to decompose the mixture into statistically independent components. Feed the ICA-separated components to the classifier instead of (or alongside) the raw mix.
-
-- **Why it helps:** gives the classifier cleaner input features with less cross-speaker contamination.
-- **Limitation:** most effective with stereo input (2 channels → 2 sources mathematically guaranteed). Usefulness on mono must be verified experimentally.
-- **Integration point:** `src/dsp/features.py` or as a pre-step in `src/pipeline.py`.
-- **To validate:** does ICA pre-processing reduce feature noise? Does it help on mono or only on stereo?
 
 ---
 
