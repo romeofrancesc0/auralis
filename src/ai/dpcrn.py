@@ -1,17 +1,16 @@
-"""Dual-Path Convolutional Recurrent Network (DPCRN) for T-F mask refinement.
+"""Dual-Path Convolutional Recurrent Network (DPCRN) — two-speaker separator.
 
 DPCRN alternates between two complementary processing paths:
-  - Intra-frame (frequency axis): dilated Conv2d captures local harmonic structure
+  - Intra-frame (frequency axis): Conv2d captures local harmonic structure
   - Inter-frame (time axis):      GRU captures speaker-turn dynamics
 
 Inspired by:
   "DPCRN: Dual-Path Convolution Recurrent Network for Single Channel
   Speech Enhancement" — Le et al., ICASSP 2022.
 
-Architecture (C=64, N=8 DualPath blocks):
-  Input (B, 3, F, T) → Encoder → [DualPath block × 8] → Decoder → (B, F, T)
-  ~302K parameters. Compatible drop-in for MaskNet — same build_input(), same
-  inference interface.
+DPCRNSeparator: primary two-speaker separator (~301K params).
+  Input  (B, 1, F, T) — normalised log-magnitude of the mixture
+  Output (B, 2, F, T) — one soft mask per source (uPIT training)
 
 Runs on CPU, CUDA, or Apple MPS without code changes.
 """
@@ -73,51 +72,11 @@ try:
 
             return x
 
-    class _DPCRN(nn.Module):
-        """Full DPCRN: encoder + N DualPath blocks + decoder.
-
-        Input/output format is identical to _CNN in mask_net.py so DPCRN
-        can serve as a higher-capacity drop-in.
-        """
-
-        def __init__(self, n_ch: int = N_CHANNELS, n_blocks: int = N_BLOCKS) -> None:
-            super().__init__()
-            self.encoder = nn.Sequential(
-                nn.Conv2d(3, n_ch, kernel_size=3, padding=1),
-                nn.BatchNorm2d(n_ch),
-                nn.ReLU(inplace=True),
-            )
-            self.blocks = nn.ModuleList(
-                [_DualPathBlock(n_ch) for _ in range(n_blocks)]
-            )
-            self.decoder = nn.Sequential(
-                nn.Conv2d(n_ch, 1, kernel_size=1),
-                nn.Sigmoid(),
-            )
-
-        def forward(self, x: "torch.Tensor") -> "torch.Tensor":
-            """
-            Args:
-                x: (B, 3, F, T)
-
-            Returns:
-                (B, F, T) refined mask in [0, 1]
-            """
-            h = self.encoder(x)
-            for block in self.blocks:
-                h = block(h)
-            return self.decoder(h).squeeze(1)   # (B, F, T)
-
-        @property
-        def n_params(self) -> int:
-            return sum(p.numel() for p in self.parameters())
-
     class _DPCRNSeparator(nn.Module):
-        """DPCRN as a primary two-speaker separator (not a mask refiner).
+        """DPCRN as a primary two-speaker separator.
 
-        Unlike _DPCRN, which refines a heuristic IRM and therefore needs the
-        attention/NMF channels, the separator sees only the normalised
-        log-magnitude spectrogram of the mixture and emits one mask per source.
+        The separator sees only the normalised log-magnitude spectrogram of the
+        mixture and emits one mask per source.
         Both masks are trained jointly with utterance-level permutation
         invariant training (uPIT, Kolbæk et al. 2017), so neither output is
         tied to a gender a priori — the attention module performs the
@@ -179,69 +138,6 @@ def _auto_device() -> str:
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "mps"
     return "cpu"
-
-
-class DPCRN:
-    """Inference wrapper around _DPCRN.
-
-    Drop-in replacement for MaskNet — identical refine() / save() / load()
-    interface, uses the same build_input() helper from mask_net.py.
-    """
-
-    def __init__(self, device: str | None = None) -> None:
-        _check_torch()
-        self._device = device or _auto_device()
-        self._model = _DPCRN().to(self._device)
-        self._model.eval()
-        logger.debug(
-            "DPCRN ready on %s  (%d params)", self._device, self._model.n_params
-        )
-
-    # ------------------------------------------------------------------
-    # Inference
-    # ------------------------------------------------------------------
-
-    def refine(
-        self,
-        magnitude: np.ndarray,
-        attention_weights: np.ndarray,
-        nmf_irm: np.ndarray,
-        gender: int = 0,   # accepted for API compatibility; DPCRN does not use it
-    ) -> np.ndarray:
-        """Refine the NMF-IRM with the DPCRN.
-
-        Args:
-            magnitude:         STFT magnitude, shape (n_freqs, n_frames)
-            attention_weights: per-frame attention in [0, 1], shape (n_frames,)
-            nmf_irm:           NMF-guided IRM in [0, 1], shape (n_freqs, n_frames)
-            gender:            accepted for interface compatibility; unused by DPCRN
-
-        Returns:
-            Refined mask in [0, 1], shape (n_freqs, n_frames)
-        """
-        from src.ai.mask_net import build_input
-        x = build_input(magnitude, attention_weights, nmf_irm)   # (3, F, T)
-        x_t = torch.from_numpy(x).unsqueeze(0).to(self._device)  # (1, 3, F, T)
-        with torch.no_grad():
-            out = self._model(x_t)              # (1, F, T)
-        return out.squeeze(0).cpu().numpy()     # (F, T)
-
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
-
-    def save(self, path: str | Path) -> None:
-        torch.save(self._model.state_dict(), path)
-        logger.info("DPCRN saved → %s", path)
-
-    @classmethod
-    def load(cls, path: str | Path, device: str | None = None) -> "DPCRN":
-        net = cls(device=device)
-        state = torch.load(path, map_location=net._device, weights_only=True)
-        net._model.load_state_dict(state)
-        net._model.eval()
-        logger.info("DPCRN loaded from %s  (device: %s)", path, net._device)
-        return net
 
 
 # ----------------------------------------------------------------------

@@ -1,14 +1,9 @@
-"""Extended evaluation of the separate-then-select flow (DPCRNSeparator + attention).
+"""Evaluation of the separate-then-select flow (DPCRNSeparator + attention).
 
-Same protocol as evaluate_extended.py: 36 samples (12 per SNR in {-3, 0, +3} dB,
-seed=123, clip=4 s). Each mixture is separated ONCE; both streams are then
-scored by the attention module and evaluated against BOTH references, so a
-single run reports female-target and male-target quality plus the
-stream-selection accuracy (attention choice vs SI-SDR oracle).
-
-Metrics are reported for the raw separated stream and for the log-MMSE
-enhanced stream, to verify whether the enhancement stage still helps in the
-new flow.
+Protocol: 36 samples (12 per SNR in {-3, 0, +3} dB, seed=123, clip=4 s).
+Each mixture is separated once; both streams are scored by the attention module
+and evaluated against both references, so a single run reports female-target
+and male-target quality plus stream-selection accuracy (vs SI-SDR oracle).
 
 Usage:
     python scripts/evaluate_separator.py [--separator models/separator.pt]
@@ -32,7 +27,6 @@ from src.ai.classifier import SpeakerClassifier
 from src.ai.dpcrn import DPCRNSeparator
 from src.ai.gmm_classifier import GenderGMM
 from src.dsp.dataset import make_samples
-from src.dsp.enhancement import enhance
 from src.utils import SAMPLE_RATE
 
 SR = SAMPLE_RATE
@@ -90,9 +84,9 @@ def main() -> None:
     attention  = AttentionModule(classifier, gmm=gmm)
 
     metric_keys = ("SI-SDR", "PESQ", "STOI")
-    # results[gender][snr]["mix"|"raw"|"enh"][metric] -> list of values
+    # results[gender][snr]["mix"|"raw"][metric] -> list of values
     results = {
-        g: {snr: {v: {k: [] for k in metric_keys} for v in ("mix", "raw", "enh")}
+        g: {snr: {v: {k: [] for k in metric_keys} for v in ("mix", "raw")}
             for snr in SNR_LEVELS}
         for g in GENDERS
     }
@@ -121,23 +115,18 @@ def main() -> None:
 
             for g in GENDERS:
                 ref = refs[g]
-                # Oracle: which stream is actually closer to this reference?
                 sdr_streams = [si_sdr(ref[: len(s)], s[: len(ref)]) for s in streams]
                 oracle_idx = int(np.argmax(sdr_streams))
                 chosen_idx = f_idx if g == "F" else 1 - f_idx
                 selection_hits[g] += int(chosen_idx == oracle_idx)
 
                 raw = selected[g]
-                enh = enhance(raw, sr=SR)
-
                 r = results[g][snr]
                 m_mix = compute_metrics(ref, mix)
                 m_raw = compute_metrics(ref, raw)
-                m_enh = compute_metrics(ref, enh)
                 for k in metric_keys:
                     r["mix"][k].append(m_mix[k])
                     r["raw"][k].append(m_raw[k])
-                    r["enh"][k].append(m_enh[k])
 
             total_done += 1
             log.info(
@@ -172,21 +161,17 @@ def main() -> None:
             print(f"{snr:>+6.1f}  {sm:>+7.2f}+-{ss:.2f}  {om:>+7.2f}+-{os_:.2f}  "
                   f"{dm:>+6.2f}+-{ds:.2f}  {pm:>9.3f}  {tm:>9.3f}")
 
-        # Aggregates over all SNR levels
-        agg = {v: {k: [] for k in metric_keys} for v in ("mix", "raw", "enh")}
+        agg = {v: {k: [] for k in metric_keys} for v in ("mix", "raw")}
         for snr in SNR_LEVELS:
-            for v in ("mix", "raw", "enh"):
+            for v in ("mix", "raw"):
                 for k in metric_keys:
                     agg[v][k].extend(results[g][snr][v][k])
 
         dm_all, ds_all = stats([o - i for o, i in zip(agg["raw"]["SI-SDR"], agg["mix"]["SI-SDR"])])
-        de_all, _ = stats([o - i for o, i in zip(agg["enh"]["SI-SDR"], agg["mix"]["SI-SDR"])])
         print("-" * W)
-        print(f"  ALL   SI-SDRi raw {dm_all:+.2f}+-{ds_all:.2f} dB | enh {de_all:+.2f} dB")
-        print(f"        PESQ  mix {np.mean(agg['mix']['PESQ']):.3f} | raw {np.mean(agg['raw']['PESQ']):.3f} "
-              f"| enh {np.mean(agg['enh']['PESQ']):.3f}")
-        print(f"        STOI  mix {np.mean(agg['mix']['STOI']):.3f} | raw {np.mean(agg['raw']['STOI']):.3f} "
-              f"| enh {np.mean(agg['enh']['STOI']):.3f}")
+        print(f"  ALL   SI-SDRi {dm_all:+.2f}+-{ds_all:.2f} dB")
+        print(f"        PESQ  mix {np.mean(agg['mix']['PESQ']):.3f} | raw {np.mean(agg['raw']['PESQ']):.3f}")
+        print(f"        STOI  mix {np.mean(agg['mix']['STOI']):.3f} | raw {np.mean(agg['raw']['STOI']):.3f}")
         print(f"        Stream selection accuracy: {selection_hits[g]}/{total_samples} "
               f"({100.0 * selection_hits[g] / total_samples:.1f}%)")
 

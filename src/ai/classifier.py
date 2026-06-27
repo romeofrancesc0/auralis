@@ -74,7 +74,7 @@ class SpeakerClassifier:
         """Return per-frame gender probabilities, shape (n_frames, n_classes).
 
         X must already be in sklearn convention: (n_frames, n_input_features).
-        Use attention.compute_mask() for the full audio → mask flow.
+        Use AttentionModule.score_female() for the full audio → score flow.
         """
         self._check_fitted()
         # MLP forward pass emits IEEE-754 RuntimeWarning on subnormal BLAS inputs —

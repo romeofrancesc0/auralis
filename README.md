@@ -13,93 +13,61 @@ Traditional *source separation* systems approach it algorithmically: separate ev
 
 Auralis addresses both sides of the problem:
 
-- **Separation** (DSP) — isolate the acoustic components of each speaker.
-- **Selective attention** (AI) — automatically select the target speaker based on acoustic features (pitch, energy, timbre, vocal gender), simulating the human auditory attention mechanism.
-
-The project covers two academic areas: **Intelligent Signal Analysis** (DSP layer) and **Artificial Intelligence** (AI layer).
+- **Separation** (DSP + AI) — the DPCRNSeparator segregates the acoustic scene into individual streams bottom-up, using the STFT as its analysis domain.
+- **Selective attention** (AI) — the attention module decides which stream corresponds to the target speaker, top-down, simulating the human auditory attention mechanism.
 
 ---
 
-## Architecture
+## Architecture — Separate-then-Select
 
 ```
-                  ┌────────────────────────┐
-   Audio mix ───► │  DSP: feature extract  │  (STFT, MFCC, pitch, energy)
-                  └───────────┬────────────┘
-                              │ 56 features / frame
-                              ▼
-                  ┌────────────────────────┐
-                  │  AI: attention module  │  MLP + GenderGMM + HMM smoothing
-                  └───────────┬────────────┘
-                              │ per-frame attention mask
-                              ▼
-                  ┌────────────────────────┐
-                  │  DSP: NMF separation   │  classifier-guided NMF + IRM
-                  └───────────┬────────────┘
-                              │ NMF-IRM
-                              ▼
-                  ┌────────────────────────┐   (optional)
-                  │  AI: MaskNet CNN       │  learned IRM refinement ~75K params
-                  └───────────┬────────────┘
-                              │ refined mask
-                              ▼
-                  ┌────────────────────────┐
-                  │  DSP: reconstruction   │  ISTFT + speech enhancement
-                  └───────────┬────────────┘
-                              ▼
-                       Isolated audio
+                  ┌──────────────────────────────┐
+   Audio mix ───► │  DPCRNSeparator (uPIT)       │  bottom-up segregation
+                  │  STFT → 2 soft masks → ISTFT │  ~301K params, no Griffin-Lim
+                  └──────────────┬───────────────┘
+                                 │ stream A, stream B
+                                 ▼
+                  ┌──────────────────────────────┐
+                  │  AttentionModule             │  top-down selection
+                  │  MLP + GenderGMM score       │  (or pitch-based, language-agnostic)
+                  └──────────────┬───────────────┘
+                                 │ selected stream
+                                 ▼
+                           Isolated audio
 ```
+
+The **bottom-up / top-down** split mirrors the two-stage model of human cocktail-party attention (Bregman 1990): the auditory system first pre-attentively segregates the scene, then selective attention focuses on the target.
 
 ---
 
 ## How It Works
 
-### 1. Pre-processing
-The input audio is loaded, resampled to 16 kHz, and transformed into the time-frequency domain via **Short-Time Fourier Transform (STFT)**.
+### 1. Separation — DPCRNSeparator
+The mixture is analysed via **STFT** (N_FFT=512 / 32 ms, hop=128 / 8 ms, Hann window, 75 % overlap). The **DPCRNSeparator** — a Dual-Path Convolutional Recurrent Network with 8 alternating Conv2d (frequency axis) + GRU (time axis) blocks — takes the normalised log-magnitude spectrogram and predicts **two soft masks** simultaneously. The masks are applied to the complex STFT of the mixture; ISTFT reconstructs two waveforms, one per source.
 
-### 2. Feature Extraction — 56 features per frame
-| Feature group | Count | Description |
-|---|---|---|
-| MFCC | 13 | Timbral envelope (cepstral coefficients) |
-| MFCC Δ | 13 | First-order temporal derivative |
-| MFCC ΔΔ | 13 | Second-order temporal derivative |
-| Pitch (F0) | 1 | Female vocal range only: 150–310 Hz via pYIN |
-| RMS energy | 1 | Signal intensity |
-| Spectral centroid | 1 | Timbral brightness |
-| Spectral rolloff | 1 | High-frequency energy distribution |
-| ZCR | 1 | Voiced/unvoiced indicator |
-| LPC | 12 | Vocal tract all-pole model, order 12 (Levinson-Durbin) |
+Training uses **utterance-level Permutation Invariant Training (uPIT)**, with neg-SI-SDR loss on the reconstructed waveforms. Because neither output is assigned to a gender during training, the separator is structurally symmetric: it handles female and male targets equally well (SI-SDRi +6.73 dB female, +6.90 dB male).
 
-### 3. Attention Module
-The attention module combines two complementary models:
+### 2. Attentional Stream Selection
+Given the two separated streams, the **AttentionModule** scores each and picks the target:
 
-- **MLP classifier** (256 → 128 → 64, ReLU, early stopping) + StandardScaler trained on IBM frame-level labels from LibriSpeech mixtures at variable SNR (−3, 0, +3 dB). Each sample is a sliding window of 11 consecutive frames (616 features total), giving the model temporal context. Training on mixture frames — not isolated voices — eliminates the train/inference domain mismatch.
-- **GenderGMM** — two Gaussian Mixture Models (16 components, diagonal covariance) trained on clean (non-mixed) LibriSpeech speech, one per gender. At inference, the log-likelihood ratio `log P(X|GMM_F) − log P(X|GMM_M)` is sigmoid-normalised to P(female) ∈ [0, 1]. Complementary to the MLP: captures the marginal acoustic distribution of each gender rather than the discriminative boundary on mixture frames.
+- **`method="classifier"` (default):** a sliding-window MLP (11 frames × 56 features = 616 inputs, trained on IBM mixture labels) blended with a **GenderGMM** log-likelihood ratio (`log P(X|GMM_F) − log P(X|GMM_M)`, trained on clean speech) yields a per-stream P(female) score. The stream whose score best matches the requested gender is selected.
+- **`method="pitch"` (language-agnostic):** mean F0 over voiced frames (70–400 Hz via pYIN) — no trained model required, works across languages.
 
-The final per-frame mask blends both signals: `0.6 × MLP + 0.4 × GMM`. A 2-state **HMM** (F-dominant / M-dominant) then applies forward-backward smoothing with asymmetric transition probabilities (p_ff=0.95, p_mf=0.20), absorbing short male interruptions (< ~40 ms) and eliminating choppy mask artefacts.
+### 3. Optional VAD Gate
+`--vad-gate` applies a smooth amplitude gate to the selected stream, muting inter-word pauses where residual bleedthrough from the other speaker may emerge. Hold time (200 ms) protects word endings from being clipped.
 
-### 4. NMF-Guided Separation
-The separation module (`nmf_separation.py`) combines two complementary signals:
+---
 
-1. **NMF decomposition** — the magnitude spectrogram is factored into K=8 spectral bases via Non-negative Matrix Factorisation (V ≈ W×H).
-2. **Dominant-frame scoring** — each NMF component k receives a "femaleness" score computed as the mean attention weight over the frames where k is dominant.
-3. **Hybrid IRM** — the final per-bin mask blends 75% attention weights (reliable temporal F/M signal) with 25% NMF soft mask (per-frequency resolution). This prevents IRM collapse when the classifier is uncertain.
-4. **Pitch refinement** — confirmed female harmonic bins are raised to ≥ 0.85 (harmonic floor); confirmed male harmonic bins are suppressed to ≤ 0.08 (male suppression).
-5. **IRM selective floor** — a global floor of 0.15 is applied after pitch refinement, only to bins not subject to explicit male harmonic suppression and only when the mean attention weight ≥ 0.25. Prevents spectral holes in male-dominant frames that degrade short-time intelligibility.
+## Evaluation Results
 
-### 5. MaskNet CNN Refinement *(optional)*
-A lightweight fully-convolutional network (~75K parameters) refines the NMF-IRM using three input channels:
+Evaluated on 36 synthetic mixtures (LibriSpeech dev-clean, SNR ∈ {−3, 0, +3} dB, seed=123):
 
-| Channel | Content |
-|---|---|
-| 0 | Log-magnitude spectrogram (zero-mean, unit-variance) |
-| 1 | Attention weights broadcast across frequency |
-| 2 | NMF-IRM as-is — the classical-pipeline prior |
+| Target | SI-SDRi | PESQ | STOI | Stream selection accuracy |
+|---|---|---|---|---|
+| Female | **+6.73 dB** | 1.475 | 0.830 | 91.7 % |
+| Male   | **+6.90 dB** | 1.505 | 0.842 | 100 %  |
 
-Trained against the ideal IRM computed from clean sources (`IRM_target(f,t) = |F|² / (|F|² + |M|²)`), using MSE loss. Runs on CPU, CUDA, and Apple MPS (M-series chips) without code changes. Requires `torch>=2.0`.
-
-### 6. Reconstruction
-The (optionally refined) IRM is applied to the complex STFT (preserving the original phase), then **ISTFT** converts back to the time domain. A final **speech enhancement** step applies the log-MMSE spectral amplitude estimator (Ephraim & Malah 1985) with decision-directed a priori SNR estimation and minimum-statistics noise tracking, followed by peak normalisation.
+Mix baseline: PESQ ≈ 1.16, STOI ≈ 0.72.
 
 ---
 
@@ -107,41 +75,30 @@ The (optionally refined) IRM is applied to the complex STFT (preserving the orig
 
 - **Python 3.10+**
 - **OS:** Linux, macOS, or Windows
-- **RAM:** 4 GB recommended
-- **GPU:** optional — required only for MaskNet training; inference runs on CPU/MPS
+- **GPU:** optional — required for training; inference runs on CPU / Apple MPS
 
 ### Main Python dependencies
 
 | Library | Purpose |
 |---|---|
-| `numpy`, `scipy` | Numerical operations, DSP, log-MMSE enhancement |
+| `numpy`, `scipy` | Numerical operations, DSP |
 | `librosa`, `soundfile` | Audio I/O and feature extraction |
 | `scikit-learn` | MLP, GMM, StandardScaler |
+| `torch>=2.0` | DPCRNSeparator training and inference |
 | `matplotlib` | Spectrograms and diagnostics |
 | `pytest` | Unit testing |
-| `torch>=2.0` *(optional)* | MaskNet training and inference |
-
-See `requirements.txt` for the full list with pinned versions.
 
 ---
 
 ## Installation
 
 ```bash
-# 1. Clone the repository
 git clone <repo-url>
 cd auralis
-
-# 2. Create and activate a virtual environment
 python3 -m venv venv
 source venv/bin/activate     # macOS / Linux
 # venv\Scripts\activate      # Windows
-
-# 3. Install dependencies
-pip install -e ".[dev]"
-
-# 4. (Optional) Install PyTorch for MaskNet
-pip install -e ".[torch]"
+pip install -e ".[dev,torch]"
 ```
 
 > **Dataset:** download LibriSpeech `dev-clean` from [openslr.org/12](https://www.openslr.org/12/) and place it under `data/raw/librispeech/dev-clean/`.
@@ -156,45 +113,24 @@ pip install -e ".[torch]"
 python demo.py
 ```
 
-Automatically generates a male/female mixture from LibriSpeech, runs the full pipeline, and saves four files to `data/processed/demo/`:
-
-| File | Description |
-|---|---|
-| `mix.wav` | Original mixture (F + M) |
-| `target.wav` | Female voice — ground truth |
-| `interferer.wav` | Male voice — ground truth |
-| `output.wav` | System output — extracted female voice |
+Generates a M+F mixture from LibriSpeech, runs the pipeline, and saves five files to `data/processed/demo/`.
 
 ### Train the models
 
 ```bash
-# Stage 1a — MLP classifier (IBM multi-SNR, ~10-20 min):
+# Stage 1a — MLP classifier (IBM multi-SNR labels, ~10-20 min):
 python -m src.ai.train --out models/classifier.joblib
 
-# Stage 1b — GenderGMM on clean LibriSpeech clips (~1 min):
+# Stage 1b — GenderGMM on clean LibriSpeech (~1 min):
 python -m src.ai.train_gmm --out models/gender_gmm.joblib
 
-# Stage 2 — MaskNet CNN (requires stage 1a + 1b, GPU recommended, ~30-60 min):
-python -m src.ai.train_mask_net \
-    --classifier models/classifier.joblib \
-    --gmm models/gender_gmm.joblib \
-    --n-samples 200 \
-    --out models/mask_net.pt
-
-# Stage 2 (alternative) — DPCRNSeparator, dual-output uPIT separation
-# (standalone: does NOT need stage 1 models in the training loop):
+# Stage 2 — DPCRNSeparator, uPIT (standalone, GPU recommended, ~2-4 h):
 python -m src.ai.train_separator \
     --n-samples 200 --epochs 60 --batch-size 4 \
     --out models/separator.pt
 ```
 
-#### Robustness training (reverberant — for real recordings)
-
-Models trained only on anechoic LibriSpeech mixtures degrade on real recordings,
-which always carry room reverberation (the *synthetic-to-real gap*). Reverb
-augmentation convolves the clean voices with **Room Impulse Responses (RIRs)**
-before mixing, so the separator learns to segregate sources in reverb without
-collecting any real data:
+#### Robustness training (reverberant audio)
 
 ```bash
 python -m src.ai.train_separator \
@@ -203,63 +139,30 @@ python -m src.ai.train_separator \
     --out models/separator_robust.pt
 ```
 
-`--rir-prob 0.5` trains on a mix of clean and reverberant conditions, so the
-model stays accurate on anechoic input while gaining real-world robustness.
-Validation reports SI-SDR on both clean and reverberant (held-out rooms) sets.
-
-> **RIR datasets** (place `.wav`/`.flac` files under `data/raw/rir/`, any layout —
-> the loader globs recursively and resamples to 16 kHz):
-> [MIT Acoustical Reverberation](https://mcdermottlab.mit.edu/Reverb/IR_Survey.html) (small, easy start),
-> [OpenSLR28 RIRs](https://www.openslr.org/28/),
-> [BUT ReverbDB](https://speech.fit.vutbr.cz/software/but-speech-fit-reverb-database).
-> If the directory is missing or empty, training falls back to clean mixtures.
+> **RIR datasets:** [MIT Acoustical Reverberation](https://mcdermottlab.mit.edu/Reverb/IR_Survey.html),
+> [OpenSLR28](https://www.openslr.org/28/), [BUT ReverbDB](https://speech.fit.vutbr.cz/software/but-speech-fit-reverb-database).
 
 ### End-to-end pipeline
 
 ```bash
-# Baseline (MLP + GMM + NMF):
+# Recommended (classifier stream selection):
 python -m src.pipeline \
     --input mix.wav \
     --model models/classifier.joblib \
-    --gmm models/gender_gmm.joblib \
-    --output out.wav
-
-# With MaskNet refinement (best quality):
-python -m src.pipeline \
-    --input mix.wav \
-    --model models/classifier.joblib \
-    --gmm models/gender_gmm.joblib \
-    --mask-net models/mask_net.pt \
-    --output out.wav
-
-# Separate-then-select (uPIT separator + attentional stream selection;
-# works equally well for both genders via --target female / male):
-python -m src.pipeline \
-    --input mix.wav \
-    --model models/classifier.joblib \
-    --gmm models/gender_gmm.joblib \
+    --gmm   models/gender_gmm.joblib \
     --separator models/separator.pt \
-    --target male \
+    --target female \
     --output out.wav
 
-# Language-agnostic stream selection (recommended for non-English / real-world audio):
-# --stream-select pitch uses mean F0 comparison instead of the trained MLP+GMM.
+# Language-agnostic (pitch-based, no trained model needed):
 python -m src.pipeline \
     --input mix.wav \
-    --model models/classifier.joblib \
-    --gmm models/gender_gmm.joblib \
     --separator models/separator.pt \
     --target male \
     --stream-select pitch \
     --vad-gate \
     --output out.wav
 ```
-
-> **`--stream-select pitch`** — selects the stream with lower (male) or higher (female) mean
-> fundamental frequency. No trained model required; works across languages.
->
-> **`--vad-gate`** — applies a smooth amplitude gate that mutes inter-word silence in the
-> output, suppressing residual bleedthrough from the interfering speaker during pauses.
 
 ### Run tests
 
@@ -274,7 +177,7 @@ pytest tests/
 ```
 auralis/
 ├── README.md
-├── ROADMAP.md                 # Development plan and progress tracking
+├── ROADMAP.md
 ├── requirements.txt
 ├── demo.py                    # Quick demo script
 │
@@ -284,50 +187,47 @@ auralis/
 │   │   ├── features.py        # 56-feature extraction per frame (MFCC, pitch, LPC, ...)
 │   │   ├── dataset.py         # LibriSpeech loader, M+F mixer, IBM dataset builder
 │   │   ├── augment.py         # RIR reverb augmentation (synthetic-to-real robustness)
-│   │   ├── enhancement.py     # Log-MMSE speech enhancement (Ephraim & Malah 1985)
-│   │   ├── separation.py      # T-F masking utilities (ratio mask, pitch mask)
-│   │   └── nmf_separation.py  # Primary separation module (classifier-guided NMF + MaskNet hook)
+│   │   └── enhancement.py     # Voice activity gate
 │   │
 │   ├── ai/
 │   │   ├── classifier.py      # SpeakerClassifier (MLP + StandardScaler)
-│   │   ├── attention.py       # AttentionModule: MLP+GMM blend + HMM smoothing
-│   │   ├── smoothing.py       # hmm_smooth(): 2-state forward-backward HMM
 │   │   ├── gmm_classifier.py  # GenderGMM: LLR = log P(X|GMM_F) - log P(X|GMM_M)
-│   │   ├── mask_net.py        # MaskNet: CNN for learned IRM refinement (~75K params)
-│   │   ├── train.py           # Multi-SNR IBM training script (MLP)
+│   │   ├── attention.py       # AttentionModule: score_female() + select_stream()
+│   │   ├── dpcrn.py           # DPCRNSeparator — primary separator (~301K params, uPIT)
+│   │   ├── train.py           # MLP classifier training script
 │   │   ├── train_gmm.py       # GenderGMM training script
-│   │   └── train_mask_net.py  # MaskNet training script (second-stage)
+│   │   └── train_separator.py # DPCRNSeparator training script (uPIT, dynamic mixing)
 │   │
 │   ├── pipeline.py            # End-to-end CLI
 │   └── utils.py               # Audio I/O utilities
 │
 ├── data/
 │   ├── raw/librispeech/       # LibriSpeech dev-clean (not tracked by git)
+│   ├── raw/rir/               # Room Impulse Responses for reverb augmentation (optional)
 │   └── processed/demo/        # Demo output files
 │
 ├── models/                    # Trained models (not tracked by git)
-│   │                          # classifier.joblib, gender_gmm.joblib, mask_net.pt
+│   │                          # classifier.joblib, gender_gmm.joblib, separator.pt
 ├── notebooks/
 │   ├── 02_evaluation.ipynb    # Quantitative metrics: SI-SDR, PESQ, STOI
 │   └── 03_diagnosis.ipynb     # Classifier vs masking stage diagnosis
-├── tests/
-│   ├── test_utils.py
-│   ├── test_features.py
-│   └── test_pipeline.py       # End-to-end integration tests (47 tests total)
-└── docs/                      # Theoretical documentation
+├── scripts/                   # Evaluation and research scripts
+└── tests/
+    ├── test_utils.py
+    ├── test_features.py
+    ├── test_augment.py
+    └── test_pipeline.py
 ```
 
 ---
 
 ## Theoretical References
 
-- **Cherry, E. C.** (1953). *Some Experiments on the Recognition of Speech, with One and with Two Ears.* Journal of the Acoustical Society of America, 25(5), 975–979. — Original definition of the cocktail party problem.
-- **Bregman, A. S.** (1990). *Auditory Scene Analysis: The Perceptual Organization of Sound.* MIT Press. — Theoretical foundation of auditory perception and source segregation.
-- **Wang, D., & Brown, G. J.** (2006). *Computational Auditory Scene Analysis: Principles, Algorithms, and Applications.* Wiley-IEEE Press.
-- **Ephraim, Y., & Malah, D.** (1984). *Speech Enhancement Using a Minimum Mean-Square Error Short-Time Spectral Amplitude Estimator.* IEEE Transactions on Acoustics, Speech, and Signal Processing, 32(6), 1109–1121. — MMSE-STSA estimator; basis for the decision-directed a priori SNR approach.
-- **Ephraim, Y., & Malah, D.** (1985). *Speech Enhancement Using a Minimum Mean-Square Error Log-Spectral Amplitude Estimator.* IEEE Transactions on Acoustics, Speech, and Signal Processing, 33(2), 443–445. — Log-MMSE gain function used in the enhancement module.
-- **Martin, R.** (2001). *Noise Power Spectral Density Estimation Based on Optimal Smoothing and Minimum Statistics.* IEEE Transactions on Speech and Audio Processing, 9(5), 504–512. — Minimum-statistics noise PSD estimator.
-- **Hyvärinen, A., & Oja, E.** (2000). *Independent Component Analysis: Algorithms and Applications.* Neural Networks, 13(4–5), 411–430.
+- **Cherry, E. C.** (1953). *Some Experiments on the Recognition of Speech, with One and with Two Ears.* JASA, 25(5). — Original definition of the cocktail party problem.
+- **Bregman, A. S.** (1990). *Auditory Scene Analysis.* MIT Press. — Bottom-up / top-down model of auditory attention.
+- **Kolbæk, M. et al.** (2017). *Multitalker Speech Separation with Utterance-Level Permutation Invariant Training.* IEEE/ACM TASLP. — uPIT training used for the DPCRNSeparator.
+- **Le, X. et al.** (2022). *DPCRN: Dual-Path Convolution Recurrent Network for Single Channel Speech Enhancement.* ICASSP. — Architectural inspiration for the separator.
+- **Wang, D., & Brown, G. J.** (2006). *Computational Auditory Scene Analysis.* Wiley-IEEE Press.
 
 ---
 

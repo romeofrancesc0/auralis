@@ -1,34 +1,25 @@
-"""End-to-end pipeline: mixture -> isolated target speaker.
+"""End-to-end pipeline: mixture -> isolated target speaker (separate-then-select).
 
-Separate-then-select flow (uPIT separator + attention stream selection):
-    python -m src.pipeline --input mix.wav \\
+The DPCRNSeparator (uPIT) segregates the scene into two streams bottom-up;
+the attention module then selects the target stream top-down — mirroring the
+cocktail-party model of human auditory attention.
+
+Usage:
+    python -m src.pipeline \\
+        --input mix.wav \\
         --model models/classifier.joblib \\
         --gmm   models/gender_gmm.joblib \\
         --separator models/separator.pt \\
-        --target male \\
+        --target female \\
         --output out.wav
 
-Classic flow (MLP + GMM + HMM + NMF + DPCRN refiner):
-    python -m src.pipeline --input mix.wav \\
-        --model models/classifier.joblib \\
-        --gmm   models/gender_gmm.joblib \\
-        --dpcrn models/dpcrn.pt \\
-        --output out.wav
-
-Isolate the male speaker instead:
-    python -m src.pipeline --input mix.wav \\
-        --model models/classifier.joblib \\
-        --gmm   models/gender_gmm.joblib \\
-        --dpcrn models/dpcrn.pt \\
+Language-agnostic (pitch-based stream selection, no trained model required):
+    python -m src.pipeline \\
+        --input mix.wav \\
+        --separator models/separator.pt \\
         --target male \\
-        --output out_male.wav
-
-Experimental alternatives (research / ablation only):
-    # MaskNet instead of DPCRN (lighter, slightly lower quality)
-    python -m src.pipeline --input mix.wav \\
-        --model models/classifier.joblib --gmm models/gender_gmm.joblib \\
-        --mask-net models/mask_net.pt --output out.wav
-
+        --stream-select pitch \\
+        --output out.wav
 """
 from __future__ import annotations
 
@@ -37,8 +28,6 @@ import logging
 
 from src.ai.attention import AttentionModule
 from src.ai.classifier import SpeakerClassifier
-from src.dsp.enhancement import enhance
-from src.dsp.nmf_separation import separate_nmf
 from src.utils import SAMPLE_RATE, load_audio, save_audio
 
 logger = logging.getLogger(__name__)
@@ -46,22 +35,25 @@ logger = logging.getLogger(__name__)
 
 def run(
     input_path: str,
-    model_path: str,
     output_path: str,
+    separator_path: str,
+    model_path: str | None = None,
     gmm_path: str | None = None,
-    mask_net_path: str | None = None,
-    dpcrn_path: str | None = None,
-    separator_path: str | None = None,
     sr: int = SAMPLE_RATE,
     target: str = "female",
     stream_select: str = "classifier",
     vad_gate: bool = False,
 ) -> None:
+    if stream_select == "classifier" and model_path is None:
+        raise ValueError(
+            "--model is required when --stream-select classifier (the default). "
+            "Use --stream-select pitch for language-agnostic selection without a trained model."
+        )
+
     logger.info("Loading audio: %s", input_path)
     audio, sr = load_audio(input_path, sr=sr)
 
-    logger.info("Loading classifier: %s", model_path)
-    classifier = SpeakerClassifier.load(model_path)
+    classifier = SpeakerClassifier.load(model_path) if model_path else None
 
     gmm = None
     if gmm_path:
@@ -72,72 +64,26 @@ def run(
     attention = AttentionModule(classifier, gmm=gmm)
     target_gender = 0 if target == "female" else 1
 
-    if separator_path:
-        # Separate-then-select flow: the DPCRNSeparator segregates the scene
-        # into two streams (bottom-up), the attention module picks the target
-        # stream (top-down). Masks are applied to the complex mix STFT, so no
-        # Griffin-Lim pass is needed.
-        from src.ai.dpcrn import DPCRNSeparator
-        logger.info("Loading DPCRNSeparator: %s", separator_path)
-        separator = DPCRNSeparator.load(separator_path)
+    from src.ai.dpcrn import DPCRNSeparator
+    logger.info("Loading DPCRNSeparator: %s", separator_path)
+    separator = DPCRNSeparator.load(separator_path)
 
-        logger.info("Separating both sources (uPIT separator)...")
-        streams = separator.separate(audio)
+    logger.info("Separating both sources (uPIT separator)...")
+    streams = separator.separate(audio)
 
-        logger.info("Selecting %s stream via attention (method=%s)...", target.upper(), stream_select)
-        reconstructed, confidence = attention.select_stream(
-            streams, target_gender=target_gender, sr=sr, method=stream_select
-        )
-        logger.info("Stream selected (confidence %.3f)", confidence)
-
-        # Log-MMSE enhancement degrades the separator output on all metrics
-        # (evaluate_separator: raw SI-SDRi +6.7/+6.9 dB vs enhanced +4.9/+5.1)
-        # — the separator residual is speech-like, not stationary noise.
-        if vad_gate:
-            from src.dsp.enhancement import voice_activity_gate
-            logger.info("Applying VAD gate...")
-            reconstructed = voice_activity_gate(reconstructed, sr=sr)
-
-        logger.info("Saving output: %s", output_path)
-        save_audio(output_path, reconstructed, sr=sr)
-        logger.info("Done.")
-        return
-    else:
-        # Classic flow: classifier-guided NMF masking + optional CNN refiner
-        # mask_net and dpcrn share the same interface (refine / save / load)
-        # Only one is active at a time; --dpcrn takes precedence over --mask-net
-        mask_net = None
-        if dpcrn_path:
-            from src.ai.dpcrn import DPCRN
-            logger.info("Loading DPCRN: %s", dpcrn_path)
-            mask_net = DPCRN.load(dpcrn_path)
-        elif mask_net_path:
-            from src.ai.mask_net import MaskNet
-            logger.info("Loading MaskNet: %s", mask_net_path)
-            mask_net = MaskNet.load(mask_net_path)
-
-        logger.info("Computing attention mask...")
-        mask = attention.compute_mask(audio, sr=sr, target_gender=target_gender)
-
-        refiner_label = ""
-        if dpcrn_path:
-            refiner_label = " + DPCRN"
-        elif mask_net_path:
-            refiner_label = " + MaskNet"
-
-        logger.info("Separating target speaker: %s (NMF%s)...", target.upper(), refiner_label)
-        reconstructed = separate_nmf(audio, mask, sr=sr, mask_net=mask_net, target_gender=target_gender)
+    logger.info("Selecting %s stream (method=%s)...", target.upper(), stream_select)
+    reconstructed, confidence = attention.select_stream(
+        streams, target_gender=target_gender, sr=sr, method=stream_select
+    )
+    logger.info("Stream selected (confidence %.3f)", confidence)
 
     if vad_gate:
         from src.dsp.enhancement import voice_activity_gate
         logger.info("Applying VAD gate...")
         reconstructed = voice_activity_gate(reconstructed, sr=sr)
 
-    logger.info("Enhancing reconstructed signal...")
-    output = enhance(reconstructed, sr=sr)
-
     logger.info("Saving output: %s", output_path)
-    save_audio(output_path, output, sr=sr)
+    save_audio(output_path, reconstructed, sr=sr)
     logger.info("Done.")
 
 
@@ -145,67 +91,51 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     parser = argparse.ArgumentParser(
-        description="Cocktail party attention: isolate target speaker from mix.\n\n"
-                    "Recommended (best quality): --model + --gmm + --mask-net",
+        description="Cocktail party attention: isolate target speaker from a two-speaker mix.\n\n"
+                    "Recommended: --model + --gmm + --separator (classifier stream selection)\n"
+                    "Language-agnostic: --separator + --stream-select pitch (no trained model needed)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    main = parser.add_argument_group("main options")
-    main.add_argument("--input",  required=True, help="Path to input mixture WAV file.")
-    main.add_argument("--output", required=True, help="Path for the output WAV file.")
-    main.add_argument("--model",  required=True, help="Path to trained classifier (.joblib).")
-    main.add_argument("--gmm",    default=None,
-                      help="Path to trained GenderGMM (.joblib). Recommended.")
-    main.add_argument("--dpcrn", default=None,
-                      help="Path to trained DPCRN (.pt). Recommended CNN refiner (best perceptual quality).")
-    main.add_argument("--separator", default=None,
-                      help="Path to trained DPCRNSeparator (.pt). Separate-then-select flow; "
-                           "takes precedence over --dpcrn / --mask-net.")
-    main.add_argument("--target", choices=["female", "male"], default="female",
-                      help="Speaker to isolate: 'female' (default) or 'male'.")
-    main.add_argument(
+    parser.add_argument("--input",     required=True, help="Path to input mixture WAV file.")
+    parser.add_argument("--output",    required=True, help="Path for the output WAV file.")
+    parser.add_argument("--separator", required=True,
+                        help="Path to trained DPCRNSeparator (.pt).")
+    parser.add_argument("--model",  default=None,
+                        help="Path to trained classifier (.joblib). "
+                             "Required for --stream-select classifier (default).")
+    parser.add_argument("--gmm",    default=None,
+                        help="Path to trained GenderGMM (.joblib). Recommended with --model.")
+    parser.add_argument("--target", choices=["female", "male"], default="female",
+                        help="Speaker to isolate: 'female' (default) or 'male'.")
+    parser.add_argument(
         "--stream-select",
         choices=["classifier", "pitch"],
         default="classifier",
         dest="stream_select",
         help=(
-            "Stream selection method (only used with --separator): "
-            "'classifier' uses MLP+GMM scores (default, trained on LibriSpeech); "
-            "'pitch' uses mean F0 comparison — language-agnostic, no trained model needed."
+            "'classifier' (default) — uses MLP+GMM scores to pick the target stream; "
+            "'pitch' — uses mean F0 comparison, language-agnostic, no trained model needed."
         ),
     )
-    main.add_argument("--sr", type=int, default=SAMPLE_RATE,
-                      help="Sample rate (default 16000).")
-    main.add_argument(
+    parser.add_argument("--sr", type=int, default=SAMPLE_RATE,
+                        help="Sample rate (default 16000).")
+    parser.add_argument(
         "--vad-gate",
         action="store_true",
         default=False,
         dest="vad_gate",
-        help=(
-            "Apply a voice activity gate to the output: mutes inter-word silence "
-            "to suppress residual bleedthrough during target speaker pauses. "
-            "Useful for male target on real-world audio."
-        ),
+        help="Apply a voice activity gate to suppress residual bleedthrough during pauses.",
     )
 
-    exp = parser.add_argument_group(
-        "experimental options",
-        "These variants are not better than the recommended config in the current evaluation.\n"
-        "Kept for research and ablation studies.",
-    )
-    exp.add_argument("--mask-net", default=None,
-                     help="Path to trained MaskNet (.pt). Lighter alternative to DPCRN; "
-                          "ignored if --dpcrn is also supplied.")
     args = parser.parse_args()
 
     run(
         input_path=args.input,
-        model_path=args.model,
         output_path=args.output,
-        gmm_path=args.gmm,
-        mask_net_path=args.mask_net,
-        dpcrn_path=args.dpcrn,
         separator_path=args.separator,
+        model_path=args.model,
+        gmm_path=args.gmm,
         sr=args.sr,
         target=args.target,
         stream_select=args.stream_select,
