@@ -3,7 +3,9 @@
 > **Status:** **v0.4.0 released** (tagged + pushed). Separate-then-select architecture: DPCRNSeparator (~301K params, dual-output masks, uPIT neg-SI-SDR, dynamic mixing, held-out-speaker validation) + attention stream selection replaces the gender-mirrored classic flow. Extended eval (36 samples, seed=123): **F SI-SDRi +6.73 dB** (was +3.12), **M SI-SDRi +6.90 dB** (was −0.55); PESQ F 1.475 / M 1.505; STOI F 0.830 / M 0.842; stream-selection accuracy F 91.7% / M 100%. **2026-06-27:** classic NMF flow removed — codebase consolidates on separate-then-select only. Deleted: `nmf_separation.py`, `separation.py`, `mask_net.py`, `smoothing.py`, `train_mask_net.py`.
 >
 > **2026-07-01 — Project reframed + single priority set.** Auralis is no longer scoped as a single-course academic exercise (binary M/F separation). It is now a **research project**: given a mixture of **N unknown, simultaneous speakers**, produce **N separated output audio streams**, one per speaker, with no fixed assumption on gender or speaker count. **The only active priority is the N-speaker extension** (see "Final Objective — N-Speaker Cocktail Party" below, promoted from "future phase" to the active roadmap). Every other previously-listed next step (RIR real-audio validation of `separator_robust.pt`, WSJ0-mix/LibriMix benchmarking, academic paper writeup) is **deprioritized and paused** — kept in this document as historical/design record only, not as pending work. They may be revisited opportunistically if they end up serving the N-speaker goal (e.g. LibriMix is itself an N-speaker dataset), but they are not scheduled.
-> **Last updated:** 2026-07-01.
+>
+> **2026-07-11 — Research direction locked: SpeechBrain + recursive unknown-N.** The "lightweight ML" constraint is dropped; the project now pursues SOTA architectures under a disciplined research method. Key insight: fixed-and-known-N separation is essentially solved (TF-GridNet ~23 dB SI-SDRi on WSJ0-2mix); the open problem is **unknown N** — counting speakers while separating. Decisions: **(1) Framework = SpeechBrain** (v1.1.0, Mar 2026, actively maintained, `torch>=2.1` uncapped) rather than Asteroid (last release Oct 2023, stale, hostile `torchmetrics==1.8.0` pin). SpeechBrain ships LibriMix/WSJ0-mix recipes and pretrained SepFormer/ReSepFormer checkpoints (`sepformer-libri2mix` 20.6 dB, `sepformer-wsj02mix` 22.4, `sepformer-wsj03mix` 19.8 — **3-speaker available out-of-the-box**, `resepformer-wsj02mix` 18.6 — resource-efficient). **(2) Benchmark = LibriMix/WSJ0-mix** with reproducible SI-SDRi; reproduce a published baseline before innovating. **(3) Unknown-N approach = recursive one-and-rest extraction (OR-PIT)** as the baseline, **attractor/EDA-style** counting as the main contribution (Phase 2). **(4) Hardware:** RTX 5070 (12 GB, Blackwell sm_120) is the training ceiling — needs WSL2 + PyTorch nightly cu128 (stable wheels don't support sm_120 yet as of Jul 2026); MacBook Pro M5 is dev/eval only (MPS). Strategy fits the 12 GB ceiling via **fine-tuning pretrained backbones**, not training SOTA from scratch. Phased plan below in the "Final Objective" section.
+> **Last updated:** 2026-07-11.
 
 This document tracks the full implementation plan. It must be consulted and updated at the start of each phase. Decisions taken move from the "Open questions" section into the body of the document.
 
@@ -650,11 +652,12 @@ Train two GMMs (`GaussianMixture`) on clean male and female speech features sepa
 
 ## Final Objective — N-Speaker Cocktail Party (ACTIVE — only priority)
 
-> **Status:** 🟢 **ACTIVE — the only scheduled priority of the project (set 2026-07-01).**
-> Foundation is in place: the stable 2-speaker separate-then-select system (v0.4.0) proved
-> the architecture (DPCRNSeparator + uPIT + attention/pitch stream selection). Every other
-> roadmap item (RIR real-audio validation, WSJ0/LibriMix benchmarking, paper writeup) is
-> paused in favor of this.
+> **Status:** 🟢 **ACTIVE — the only scheduled priority of the project (set 2026-07-01; direction locked 2026-07-11).**
+> Foundation: the stable 2-speaker separate-then-select system (v0.4.0) proved the two-stage
+> segregate-then-select idea; the N-speaker work is now built on **SpeechBrain + LibriMix**
+> with a recursive (OR-PIT) unknown-N mechanism, not on generalizing the in-house DPCRN.
+> Every other roadmap item (RIR real-audio validation, standalone benchmarking, paper writeup)
+> is paused in favor of this. See the phased plan below.
 
 **Project reframing (2026-07-01):** Auralis moves from a two-course academic exercise
 (binary M/F "cocktail party attention" demo) to a **research project**. The goal is no
@@ -670,25 +673,42 @@ the mixture into N individual output streams — one waveform per speaker — ra
 selecting a single target. Speaker selection/attention (the original cocktail-party framing)
 becomes an optional downstream step on top of full separation, not the end goal itself.
 
-### Architectural considerations
+### Approach selection (decided 2026-07-11)
 
-| Approach | Description | Pros | Cons |
+The framing question is **not "can we separate?"** but **"can we separate when N is unknown?"** Fixed-and-known-N separation is a solved problem; the research contribution lives in the unknown-count mechanism.
+
+**Fixed-N backbones (solved, used as building blocks):**
+
+| Backbone | Notes |
+|---|---|
+| **Conv-TasNet** | Time-domain, ~5M params, trainable from scratch on 12 GB |
+| **SepFormer** | Transformer, SOTA (~22 dB on WSJ0-2mix) but heavy; use **pretrained**, don't train from scratch on 12 GB |
+| **ReSepFormer** | Resource-efficient SepFormer variant — attractive candidate for the RTX 5070's 12 GB ceiling |
+| **TF-GridNet** | Current SOTA (~23 dB); training from scratch is out of reach on 12 GB |
+
+**Unknown-N mechanisms (the actual research):**
+
+| Mechanism | Description | Pros | Cons |
 |---|---|---|---|
-| **Conv-TasNet** | Time-domain end-to-end network, learns N masks simultaneously | Best separation quality (state-of-art) | Breaks STFT pipeline; ~2M params; needs large training set |
-| **SepFormer** | Transformer-based, handles variable N | SOTA on WSJ0-mix benchmarks | Very large (~26M params); GPU required at inference |
-| **Speaker-conditioned DPCRN** | Extend current DPCRN with a speaker embedding (d-vector/x-vector) as conditioning | Compatible with existing pipeline; incremental upgrade | Requires speaker enrollment at inference |
-| **Permutation-invariant NMF** | Extend NMF to K≥3 speakers with PIT-style assignment | Minimal architecture change | Degrades rapidly beyond 3 speakers |
+| **Recursive one-and-rest (OR-PIT)** | Extract one speaker, subtract from mix, repeat until residual is silence (VAD stop) | Reuses a strong 2-speaker/extractor backbone; N emerges from the stop condition; cheap to iterate | Error accumulates per iteration; N forward passes; degrades beyond N≈3–4 |
+| **Attractor / EDA-style** | Generate attractors one at a time with a stop mechanism that decides N | Single-pass; elegant unknown-count | More complex to train; harder to leverage pretrained weights |
+| **Deep Clustering / DANet** | T-F embeddings + clustering; K estimable | Naturally handles variable K | Older; clustering step adds inference cost |
 
-### Recommended path
+**Decision:** recursive OR-PIT as the **baseline** (fast, reuses pretrained SpeechBrain backbones), attractor/EDA as the **main contribution** (Phase 4). Frameworks in the "lightweight ML" era (custom DPCRN) are kept only as the v0.4.0 historical reference — the new work is built on SpeechBrain.
 
-1. **Speaker embedding integration** — extract a d-vector (speaker embedding) from a short enrollment clip using a pretrained model (e.g., `speechbrain` SpeakerRecognition). Replace the binary gender label with a continuous embedding as conditioning signal.
-2. **DPCRN speaker conditioning** — replace the FiLM gender embedding (2-class) with a speaker embedding projection layer. The DPCRN then conditions its mask refinement on the target speaker's acoustic profile rather than just gender.
-3. **Multi-speaker dataset** — extend `src/dsp/dataset.py` to generate N-speaker mixes (N=3 initially) using LibriSpeech clips across genders and accents.
-4. **Evaluation** — SI-SDR, PESQ, STOI on WSJ0-2mix / LibriMix benchmarks for comparison against published baselines.
+### Phased plan
+
+- **Phase 0 — Environment validation (~30 min).** On the Windows desktop: WSL2 + PyTorch nightly cu128; confirm `torch.cuda.is_available()` and a forward pass on the RTX 5070 (Blackwell sm_120). Do this *before* writing code — if Blackwell doesn't run, find out immediately.
+- **Phase 1 — Reproducible baseline.** Install SpeechBrain (v1.1.0+), generate Libri2Mix, load pretrained `sepformer-libri2mix`, and **reproduce the published SI-SDRi (~20.6 dB, ±0.5 dB)**. Establishes trustworthy pipeline + metrics before any innovation.
+- **Phase 2 — 3-speaker stepping stone.** Use pretrained `sepformer-wsj03mix` to validate metrics/infra on N=3 without training anything.
+- **Phase 3 — Recursive N-way extraction (baseline contribution).** Implement OR-PIT one-and-rest extraction with VAD stop; fine-tune a pretrained backbone (lightweight candidate: `resepformer`). Evaluate **speaker-counting accuracy** and **separation quality** jointly on N=2,3,(4).
+- **Phase 4 — Attractor / EDA (main contribution, optional).** Single-pass count-and-separate via generated attractors + stop. Heavy training → rent cloud GPU (A100/H100) by the hour, not the 5070.
 
 ### Dependencies
 
-- Stable 2-speaker pipeline (current) ✅
-- Pretrained speaker embedding model (e.g., `speechbrain>=1.0`)
-- Multi-speaker mixture dataset (LibriMix or custom LibriSpeech N-mix)
-- GPU for DPCRN retraining with speaker conditioning
+- `speechbrain>=1.1` (v1.1.0, Mar 2026; `torch>=2.1`, no upper cap)
+- PyTorch nightly **cu128** (RTX 5070 / Blackwell sm_120 — stable wheels lack sm_120 as of Jul 2026)
+- WSL2 (Ubuntu) on the Windows desktop — native Windows Blackwell + PyTorch is painful
+- LibriMix (Libri2/3Mix) and/or WSJ0-mix datasets
+- RTX 5070 (12 GB) for fine-tuning; MacBook Pro M5 for dev/eval/listening only (MPS, no CUDA)
+- Cloud GPU (optional, Phase 4 only) for from-scratch attractor-model training
