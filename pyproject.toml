@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "auralis"
 version = "0.1.0"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
     "scipy>=1.11",
@@ -18,14 +18,19 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4", "jupyter>=1.0", "pesq>=0.0.4", "pystoi>=0.4"]
+# Legacy v0.4.0 DPCRNSeparator only.
 torch = ["torch>=2.0"]
+# N-speaker research track: pretrained SepFormer/ReSepFormer backbones and
+# LibriMix/WSJ0-mix recipes. On Blackwell GPUs (RTX 50xx, sm_120) torch must be
+# installed separately from the cu128 nightly index — stable wheels lack sm_120.
+separation = ["speechbrain>=1.1", "torch>=2.1", "torchaudio>=2.1"]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]
 
 [tool.pyrefly]
-python_interpreter = "venv/bin/python"
+python_interpreter = ".venv/bin/python"
 search_path = ["."]
 
 [tool.pytest.ini_options]

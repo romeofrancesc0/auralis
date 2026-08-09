@@ -85,6 +85,7 @@ Mix baseline: PESQ ≈ 1.16, STOI ≈ 0.72.
 | `librosa`, `soundfile` | Audio I/O and feature extraction |
 | `scikit-learn` | MLP, GMM, StandardScaler |
 | `torch>=2.0` | DPCRNSeparator training and inference |
+| `speechbrain>=1.1` | Pretrained separation backbones (N-speaker research track) |
 | `matplotlib` | Spectrograms and diagnostics |
 | `pytest` | Unit testing |
 
@@ -95,11 +96,23 @@ Mix baseline: PESQ ≈ 1.16, STOI ≈ 0.72.
 ```bash
 git clone <repo-url>
 cd auralis
-python3 -m venv venv
-source venv/bin/activate     # macOS / Linux
-# venv\Scripts\activate      # Windows
-pip install -e ".[dev,torch]"
+python3 -m venv .venv
+source .venv/bin/activate     # macOS / Linux
+# .venv\Scripts\activate      # Windows
+pip install -e ".[dev,separation]"
 ```
+
+Verify the separation stack (interpreter, PyTorch build, GPU, pretrained checkpoint):
+
+```bash
+python scripts/check_separation_env.py
+```
+
+> **Blackwell GPUs (RTX 50xx, sm_120):** install `torch` from the cu128 nightly
+> index rather than the stable wheels, which do not ship sm_120 kernels.
+>
+> **Apple Silicon:** SpeechBrain 1.1.0 inference runs on CPU, not MPS — its
+> `Pretrained` base class only assigns a device type for `cpu` and `cuda`.
 
 > **Dataset:** download LibriSpeech `dev-clean` from [openslr.org/12](https://www.openslr.org/12/) and place it under `data/raw/librispeech/dev-clean/`.
 
