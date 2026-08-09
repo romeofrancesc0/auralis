@@ -702,7 +702,20 @@ The framing question is **not "can we separate?"** but **"can we separate when N
 - **Phase 1 — Reproducible baseline.** Install SpeechBrain (v1.1.0+), generate Libri2Mix, load pretrained `sepformer-libri2mix`, and **reproduce the published SI-SDRi (~20.6 dB, ±0.5 dB)**. Establishes trustworthy pipeline + metrics before any innovation.
 - **Phase 2 — 3-speaker stepping stone.** Use pretrained `sepformer-wsj03mix` to validate metrics/infra on N=3 without training anything.
 - **Phase 3 — Recursive N-way extraction (baseline contribution).** Implement OR-PIT one-and-rest extraction with VAD stop; fine-tune a pretrained backbone (lightweight candidate: `resepformer`). Evaluate **speaker-counting accuracy** and **separation quality** jointly on N=2,3,(4).
-- **Phase 4 — Attractor / EDA (main contribution, optional).** Single-pass count-and-separate via generated attractors + stop. Heavy training → rent cloud GPU (A100/H100) by the hour, not the 5070.
+- **Phase 4 — ⚠️ being re-scoped (see below).** Originally: single-pass attractor/EDA count-and-separate as the main contribution.
+
+### Phase 4 re-scoping (2026-08-09 literature review)
+
+A state-of-the-art review — [`docs/research/unknown-n-state-of-the-art.md`](docs/research/unknown-n-state-of-the-art.md) — found that **attractor-based unknown-N counting as originally planned is no longer an open problem**. SepEDA (2022), SepTDA (2024) and SepNetEDCI (2025) all exceed 95% speaker counting accuracy on WSJ0-{2,3,4,5}Mix; at N=2 they sit at ~99.9%.
+
+What remains open, per the review:
+
+1. **Quality vs. termination robustness.** SepTDA leads separation by 2–6 dB but its counting drops to 90.1% (N=4) and 83.2% (N=5); SepNetEDCI trades that quality margin for 95.7% counting at N=5. Nobody has both.
+2. **No shared benchmark for realistic conditions.** Every published number above is anechoic, 100%-overlapped, single-utterance, 8 kHz simulated audio. The one work targeting reverberant multi-utterance mixtures (A-DCSS, 2025) reports 9.7 dB ΔSI-SDR on data it synthesized itself — roughly half the anechoic figure, and not comparable to anyone else's.
+
+Three candidate directions are documented with feasibility notes against the RTX 5070 ceiling: **G1** a reproducible robustness benchmark for unknown-N counting (overlap ratio × RT60 × noise × N, reusing `src/dsp/augment.py`), **G2** termination-criterion robustness for recursive extraction, **G3** closing the quality/counting trade-off. **Recommendation: G1, then G2.** *Pending explicit decision — Phase 4 stays open until then.* Phases 0–3 are unaffected.
+
+Reproduction targets and the evaluation protocol for Phases 1–2 are pinned in [`docs/research/reproduction-targets.md`](docs/research/reproduction-targets.md).
 
 ### Dependencies
 
