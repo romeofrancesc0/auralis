@@ -47,9 +47,16 @@ claim. The gap between the two curves *is* the cost of not knowing N.
 | Speakers N | 2, 3 | SparseLibriMix 2- and 3-speaker sets |
 | Overlap ratio | 0, 0.2, 0.4, 0.6, 0.8, 1.0 | SparseLibriMix (500 mixtures per ratio, 15 s each) |
 | Reverberation RT60 | anechoic, 0.2, 0.4, 0.6, 0.8 s | Simulated RIRs (pyroomacoustics), applied via `src/dsp/augment.py` |
-| Noise SNR | clean, 10, 5, 0 dB | WHAM! noise (test partition) |
+| ~~Noise SNR~~ | *deferred to iteration 2* | WHAM! noise (test partition) |
 
-Full grid: 2 × 6 × 5 × 4 = 240 cells, each evaluated under oracle-N and estimated-N.
+Grid: 2 × 6 × 5 = 60 cells, each evaluated under oracle-N and estimated-N.
+
+**Why noise is deferred.** It is the least novel axis — WHAMR! already covers noisy-reverberant
+audio at fixed N=2, and `sepformer-whamr` exists as a pretrained comparison — whereas overlap ×
+reverberation × *counting* is the actual gap. It is also by far the most expensive: WHAM! noise is
+68 GB compressed and 76 GB unpacked, of which only the test partition would be used. Deferring it
+takes the data footprint under 1 GB and the grid from 240 cells to 60. The generator is built with
+the axis present but disabled, so adding it later is a configuration change rather than a rewrite.
 
 **Reverberation is simulated, not recorded.** A benchmark axis has to be metric, not ordinal:
 simulation gives an exact target RT60 per cell and requires no 4 GB corpus download from anyone
@@ -97,7 +104,10 @@ Only test material is needed — no training split of anything.
 
 | Asset | Purpose | Notes |
 |---|---|---|
-| LibriSpeech `test-clean` | Source speech | ~346 MB; `dev-clean` already on disk is not a substitute |
-| WHAM! noise (test partition) | Noise axis | Full WHAM! is far larger; only `tt` is required |
-| SparseLibriMix | Overlap axis | Generated from the two above via the upstream scripts |
+| LibriSpeech `test-clean` | Source speech | ~346 MB; `dev-clean` already on disk is not a substitute — the published numbers are on the test set |
+| SparseLibriMix | Overlap axis | Generated from LibriSpeech via the upstream scripts |
 | Libri2Mix test split | G1.2 reproduction only | Full Libri2Mix is ~430 GB — generate the test split alone |
+| ~~WHAM! noise~~ | Deferred with the noise axis | 68 GB compressed |
+
+The G1.2 reproduction target is the **`mix_clean`** condition: the SpeechBrain recipe hparams for
+`sepformer-libri2mix` set `use_wham_noise: False`, so reaching 20.6 dB needs no noise data at all.
