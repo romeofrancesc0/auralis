@@ -8,6 +8,7 @@ import pytest
 
 from src.data.librimix import MixtureItem
 from src.eval.harness import evaluate
+from src.eval.metrics import DEFAULT_FLOOR_DB
 from src.eval.registry import append_log_row, save_results, slugify
 
 SR = 16_000
@@ -69,8 +70,8 @@ def test_under_separation_penalises_the_missed_reference(dataset):
     docs/research/reproduction-targets.md): every reference must be accounted for.
 
     A separator that perfectly extracts one of two speakers must not score like a
-    perfect two-speaker system — the reference it never emitted contributes the
-    silence score (0 dB SI-SDR, hence no improvement over the mixture).
+    perfect two-speaker system — the reference it never emitted is scored at the
+    floor, so its improvement is the floor minus the mixture's own SI-SDR.
     """
     lookup = {float(it.mixture.sum()): it.sources for it in dataset}
     result = evaluate(lambda m, sr: [lookup[float(m.sum())][0]],
@@ -83,7 +84,9 @@ def test_under_separation_penalises_the_missed_reference(dataset):
 
     extracted, missed = max(result.items[0].si_sdri), min(result.items[0].si_sdri)
     assert extracted > 50.0                      # the speaker the model did emit
-    assert missed == pytest.approx(0.0, abs=0.5) # the one it did not
+    baseline = result.items[0].si_sdr_in[result.items[0].si_sdri.index(missed)]
+    assert missed == pytest.approx(DEFAULT_FLOOR_DB - baseline)
+    assert summary["floor_db"] == DEFAULT_FLOOR_DB
 
     full = evaluate(lambda m, sr: list(lookup[float(m.sum())]),
                     dataset, "oracle", perceptual=False)
@@ -96,9 +99,26 @@ def test_count_confusion_breaks_down_the_errors(dataset):
     assert result.summary()["count_confusion"] == {"2->3": 2}
 
 
-def test_empty_output_is_rejected(dataset):
-    with pytest.raises(ValueError, match="no estimate"):
-        evaluate(lambda m, sr: [], dataset, "broken", perceptual=False)
+def test_empty_output_is_scored_as_zero_speakers(dataset):
+    """N_hat = 0 is a counting error to measure, not a crash to raise."""
+    result = evaluate(lambda m, sr: [], dataset, "silent", perceptual=False)
+    assert result.summary()["count_confusion"] == {"2->0": 2}
+    assert all(v == DEFAULT_FLOOR_DB for it in result.items for v in it.si_sdr_out)
+
+
+def test_count_correct_mean_isolates_quality_from_counting(dataset):
+    """Quality on correctly counted mixtures must ignore the miscounted ones."""
+    lookup = {float(it.mixture.sum()): it.sources for it in dataset}
+    first = float(dataset[0].mixture.sum())
+
+    def separate(m, sr):
+        a, b = lookup[float(m.sum())]
+        near = [a + 0.05 * b, b + 0.05 * a]
+        return near if float(m.sum()) == first else near[:1]
+
+    summary = evaluate(separate, dataset, "partial", perceptual=False).summary()
+    assert summary["count_accuracy"] == 0.5
+    assert summary["si_sdri_mean_count_correct"] > summary["si_sdri_mean"]
 
 
 def test_save_results_writes_json_and_log_row(tmp_path, dataset):
