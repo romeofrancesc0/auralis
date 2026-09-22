@@ -12,6 +12,10 @@ dependencies = [
     "librosa>=0.10",
     "soundfile>=0.12",
     "matplotlib>=3.7",
+    # Simulated RIRs give the G1 benchmark an exact RT60 per condition, which a
+    # recorded corpus cannot, and spare anyone rerunning it a 4 GB download.
+    # Core rather than an extra: condition generation needs no torch.
+    "pyroomacoustics>=0.8",
 ]
 
 [project.optional-dependencies]
@@ -19,14 +23,7 @@ dev = ["pytest>=7.4", "jupyter>=1.0", "pesq>=0.0.4", "pystoi>=0.4"]
 # N-speaker research track: pretrained SepFormer/ReSepFormer backbones and
 # LibriMix/WSJ0-mix recipes. On Blackwell GPUs (RTX 50xx, sm_120) torch must be
 # installed separately from the cu128 nightly index — stable wheels lack sm_120.
-separation = [
-    "speechbrain>=1.1",
-    "torch>=2.1",
-    "torchaudio>=2.1",
-    # Simulated RIRs give the G1 benchmark an exact RT60 per condition, which a
-    # recorded corpus cannot, and spare anyone rerunning it a 4 GB download.
-    "pyroomacoustics>=0.8",
-]
+separation = ["speechbrain>=1.1", "torch>=2.1", "torchaudio>=2.1"]
 
 [tool.setuptools.packages.find]
 where = ["."]

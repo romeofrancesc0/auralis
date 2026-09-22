@@ -24,8 +24,9 @@ jobs:
 
       - name: Install dependencies
         # Core dependencies only. The separation extra (speechbrain, torch) and
-        # pesq/pystoi stay out of CI on purpose: the metrics and the harness are
-        # pure numpy, so the suite runs in seconds without a GPU stack.
+        # pesq/pystoi stay out of CI on purpose: the metrics, the harness and the
+        # condition generator need no torch, so the suite runs in seconds without
+        # a GPU stack.
         run: |
           python -m pip install --upgrade pip
           pip install -e .
