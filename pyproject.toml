@@ -11,15 +11,11 @@ dependencies = [
     "scipy>=1.11",
     "librosa>=0.10",
     "soundfile>=0.12",
-    "scikit-learn>=1.3",
     "matplotlib>=3.7",
-    "joblib>=1.3",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4", "jupyter>=1.0", "pesq>=0.0.4", "pystoi>=0.4"]
-# Legacy v0.4.0 DPCRNSeparator only.
-torch = ["torch>=2.0"]
 # N-speaker research track: pretrained SepFormer/ReSepFormer backbones and
 # LibriMix/WSJ0-mix recipes. On Blackwell GPUs (RTX 50xx, sm_120) torch must be
 # installed separately from the cu128 nightly index — stable wheels lack sm_120.

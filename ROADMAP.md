@@ -371,6 +371,41 @@ Remaining gap due to DPCRN trained on old distribution — requires retraining w
 
 ---
 
+## Legacy removal (2026-09-22)
+
+The repository held two complete systems in parallel: the v0.4.0 binary male/female
+pipeline and the unknown-N research track. Keeping both made it unclear which files
+any given phase actually depends on, so the v0.4.0 track was removed.
+
+An earlier note in this file said to measure a v0.4.0 baseline on Libri2Mix before
+removing anything, to preserve continuity. That reasoning assumed the DPCRN line would
+continue. It does not — the locked direction fine-tunes pretrained SpeechBrain backbones
+— so there is no continuity to preserve and the measurement was dropped along with the code.
+
+**Removed** (~2,400 lines; all recoverable from tag `v0.4.0`):
+`src/ai/` in full (classifier, gmm_classifier, attention, dpcrn, train, train_gmm,
+train_separator), `src/dsp/features.py` (the 56-feature extractor served only the gender
+classifier), `src/dsp/dataset.py` (M+F mixer and IBM ground truth), `src/pipeline.py`,
+`demo.py`, `scripts/evaluate_separator.py`, the three notebooks, and
+`tests/test_features.py` + `tests/test_pipeline.py`.
+
+**Kept**, because the state-of-the-art review earmarks them for G1/G2:
+`src/dsp/augment.py` (RIR augmentation, for the reverberation sweep) and
+`src/dsp/enhancement.py::voice_activity_gate` (a candidate stop criterion for recursive
+extraction), with their dependencies `src/utils.py` and `src/dsp/stft.py`. The gate's
+three tests were moved out of the deleted pipeline suite into `tests/test_enhancement.py`
+rather than dropped.
+
+**Follow-on cleanup:** `scikit-learn` and `joblib` left the dependency list (they served
+only the removed classifier and GMM), the legacy `torch` extra was dropped in favour of
+`separation`, `scripts/evaluate.py` no longer offers a DPCRN path, and the README was
+rewritten around the unknown-N goal — it still advertised the two-speaker demo.
+
+The Progress table further down this file describes the six phases of that removed system.
+It is kept as historical record; it no longer describes the codebase.
+
+---
+
 ## Evaluation infrastructure (2026-09-22)
 
 Phase 1 asks for a reproduction of a published number. That is only meaningful if the

@@ -6,15 +6,11 @@ Numbers produced this way are comparable with published baselines and with
 every past experiment in EXPERIMENTS.md.
 
 Examples:
-    # Baseline of the current 2-source separator on the Libri2Mix test split
+    # Control run: no separation at all — SI-SDRi must come out at ~0 dB
     python scripts/evaluate.py \\
         --metadata metadata/Libri2Mix/libri2mix_test.csv \\
-        --librispeech-root data/raw/librispeech \\
-        --separator models/separator.pt \\
-        --experiment-id dpcrn-upit-v0.4.0-libri2mix-test
-
-    # Control run: no separation at all — SI-SDRi must come out at ~0 dB
-    python scripts/evaluate.py --metadata ... --separator none --experiment-id control-mixture
+        --librispeech-root data/raw/librispeech --sr 8000 \\
+        --separator none --experiment-id control-mixture
 
     # Phase 1 reproduction: pretrained SepFormer on Libri2Mix test (8 kHz, min)
     python scripts/evaluate.py \\
@@ -40,14 +36,13 @@ from src.eval.registry import save_results             # noqa: E402
 
 logger = logging.getLogger("evaluate")
 
-DPCRN_SR      = 16_000   # the legacy separator's STFT parameters are tied to this rate
 SPEECHBRAIN_SR = 8_000   # published sample rate of the sepformer/resepformer checkpoints
 
 
 def build_separator(path: str, n_sources: int, sr: int = 16_000):
     """Return a `separate(mixture, sr) -> list[np.ndarray]` callable.
 
-    Three forms are accepted:
+    Two forms are accepted:
 
     * ``none`` — the control: hands back copies of the mixture, so the harness
       must report SI-SDRi ≈ 0 dB. Any deviation means the metric plumbing is
@@ -55,7 +50,6 @@ def build_separator(path: str, n_sources: int, sr: int = 16_000):
     * ``speechbrain:<source>`` — a pretrained SpeechBrain separator, e.g.
       ``speechbrain:speechbrain/sepformer-libri2mix``. This is the Phase 1
       reproduction path; those checkpoints are 8 kHz, so pass ``--sr 8000``.
-    * anything else — a path to a legacy v0.4.0 DPCRNSeparator checkpoint.
     """
     if path.lower() == "none":
         logger.info("Control separator: returning %d copies of the mixture", n_sources)
@@ -64,18 +58,10 @@ def build_separator(path: str, n_sources: int, sr: int = 16_000):
     if path.startswith("speechbrain:"):
         return _speechbrain_separator(path.split(":", 1)[1], sr)
 
-    if sr != DPCRN_SR:
-        raise ValueError(
-            f"The DPCRN separator operates at {DPCRN_SR} Hz (its STFT parameters are "
-            f"fixed); --sr {sr} would silently mis-scale every mixture. Re-run at "
-            f"{DPCRN_SR} Hz, or use --separator none for a control run at this rate."
-        )
-
-    from src.ai.dpcrn import DPCRNSeparator           # imported lazily: needs torch
-
-    separator = DPCRNSeparator.load(path)
-    logger.info("Loaded DPCRNSeparator from %s", path)
-    return lambda mixture, sr: list(separator.separate(mixture))
+    raise ValueError(
+        f"Unrecognised separator {path!r}. Use 'speechbrain:<hf-source>' for a "
+        "pretrained checkpoint, or 'none' for the control run."
+    )
 
 
 def _speechbrain_separator(source: str, sr: int):
@@ -120,8 +106,8 @@ def main() -> None:
     parser.add_argument("--mix-dir", default="mix_clean",
                         help="Mixture subdirectory (with --wav-dir). Default: mix_clean.")
     parser.add_argument("--separator", required=True,
-                        help="'speechbrain:<hf-source>' for a pretrained checkpoint, a path "
-                             "to a legacy separator.pt, or 'none' for the control run.")
+                        help="'speechbrain:<hf-source>' for a pretrained checkpoint, "
+                             "or 'none' for the control run.")
     parser.add_argument("--experiment-id", required=True,
                         help="Identifier for results/<id>.json and the EXPERIMENTS.md row.")
     parser.add_argument("--notes", default="", help="One-line note stored with the run.")

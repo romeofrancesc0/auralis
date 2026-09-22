@@ -1,93 +1,82 @@
 # Auralis
 
-> **AI-based selective auditory attention system inspired by the cocktail party problem.**
-> Not just source separation — a simulation of the human cognitive mechanism that decides *which* speaker to listen to.
+> **Single-channel speech separation when the number of speakers is unknown.**
+> A research project on the cocktail party problem — not only separating voices,
+> but deciding how many there are to separate.
 
 ---
 
 ## The Problem
 
-In a crowded room — a party, a café, a meeting — the human brain performs a remarkable feat: it focuses on a single voice while filtering out all others. This is the **cocktail party problem**, first formalised by Colin Cherry in 1953.
+In a crowded room the human brain follows one voice among many. Colin Cherry
+formalised this in 1953 as the **cocktail party problem**, and seventy years later
+one half of it is essentially solved: given a mixture of a *known* number of
+speakers, modern systems separate it at ~23 dB SI-SDRi.
 
-Traditional *source separation* systems approach it algorithmically: separate every audio source present in the signal. But they miss the crucial next step — the one that is truly human: **deciding which voice to pay attention to**.
+The other half is open. Real audio does not announce how many people are talking.
+A system that must be told "there are three voices here" is not solving the
+cocktail party problem — it is solving an easier one.
 
-Auralis addresses both sides of the problem:
-
-- **Separation** (DSP + AI) — the DPCRNSeparator segregates the acoustic scene into individual streams bottom-up, using the STFT as its analysis domain.
-- **Selective attention** (AI) — the attention module decides which stream corresponds to the target speaker, top-down, simulating the human auditory attention mechanism.
-
----
-
-## Architecture — Separate-then-Select
-
-```
-                  ┌──────────────────────────────┐
-   Audio mix ───► │  DPCRNSeparator (uPIT)       │  bottom-up segregation
-                  │  STFT → 2 soft masks → ISTFT │  ~301K params, no Griffin-Lim
-                  └──────────────┬───────────────┘
-                                 │ stream A, stream B
-                                 ▼
-                  ┌──────────────────────────────┐
-                  │  AttentionModule             │  top-down selection
-                  │  MLP + GenderGMM score       │  (or pitch-based, language-agnostic)
-                  └──────────────┬───────────────┘
-                                 │ selected stream
-                                 ▼
-                           Isolated audio
-```
-
-The **bottom-up / top-down** split mirrors the two-stage model of human cocktail-party attention (Bregman 1990): the auditory system first pre-attentively segregates the scene, then selective attention focuses on the target.
+**Auralis targets the unknown-N case:** given a mixture of N unknown, simultaneous
+speakers, produce N separated streams, one per speaker, deciding N itself.
 
 ---
 
-## How It Works
+## Research direction
 
-### 1. Separation — DPCRNSeparator
-The mixture is analysed via **STFT** (N_FFT=512 / 32 ms, hop=128 / 8 ms, Hann window, 75 % overlap). The **DPCRNSeparator** — a Dual-Path Convolutional Recurrent Network with 8 alternating Conv2d (frequency axis) + GRU (time axis) blocks — takes the normalised log-magnitude spectrogram and predicts **two soft masks** simultaneously. The masks are applied to the complex STFT of the mixture; ISTFT reconstructs two waveforms, one per source.
+The current state of the art is reviewed in
+[`docs/research/unknown-n-state-of-the-art.md`](docs/research/unknown-n-state-of-the-art.md).
+Two findings shape the plan:
 
-Training uses **utterance-level Permutation Invariant Training (uPIT)**, with neg-SI-SDR loss on the reconstructed waveforms. Because neither output is assigned to a gender during training, the separator is structurally symmetric: it handles female and male targets equally well (SI-SDRi +6.73 dB female, +6.90 dB male).
+1. **Speaker counting on the standard benchmarks is saturated.** SepEDA (2022),
+   SepTDA (2024) and SepNetEDCI (2025) all exceed 95 % counting accuracy on
+   WSJ0-{2,3,4,5}Mix; at N=2 they sit at ~99.9 %.
+2. **What remains open** is the trade-off between separation quality and
+   termination robustness — SepTDA leads by 2–6 dB but its counting collapses to
+   83 % at N=5, while SepNetEDCI holds 96 % by giving up that quality — and the
+   absence of a shared benchmark for *realistic* conditions. Every published
+   number is anechoic, fully overlapped, single-utterance, simulated audio.
 
-### 2. Attentional Stream Selection
-Given the two separated streams, the **AttentionModule** scores each and picks the target:
+The work proceeds in phases, detailed in [`ROADMAP.md`](ROADMAP.md): validate the
+environment, **reproduce a published baseline before innovating**, use a
+pretrained 3-speaker model as a stepping stone, then build recursive one-and-rest
+extraction with a stop criterion. Reproduction targets and the evaluation
+protocol are pinned in
+[`docs/research/reproduction-targets.md`](docs/research/reproduction-targets.md).
 
-- **`method="classifier"` (default):** a sliding-window MLP (11 frames × 56 features = 616 inputs, trained on IBM mixture labels) blended with a **GenderGMM** log-likelihood ratio (`log P(X|GMM_F) − log P(X|GMM_M)`, trained on clean speech) yields a per-stream P(female) score. The stream whose score best matches the requested gender is selected.
-- **`method="pitch"` (language-agnostic):** mean F0 over voiced frames (70–400 Hz via pYIN) — no trained model required, works across languages.
-
-### 3. Optional VAD Gate
-`--vad-gate` applies a smooth amplitude gate to the selected stream, muting inter-word pauses where residual bleedthrough from the other speaker may emerge. Hold time (200 ms) protects word endings from being clipped.
+Models are **fine-tuned from pretrained SpeechBrain backbones** rather than
+trained from scratch: the hardware ceiling is a single 12 GB GPU, and a method
+that does not fit the available compute is not a method.
 
 ---
 
-## Evaluation Results
+## Status
 
-Evaluated on 36 synthetic mixtures (LibriSpeech dev-clean, SNR ∈ {−3, 0, +3} dB, seed=123):
-
-| Target | SI-SDRi | PESQ | STOI | Stream selection accuracy |
-|---|---|---|---|---|
-| Female | **+6.73 dB** | 1.475 | 0.830 | 91.7 % |
-| Male   | **+6.90 dB** | 1.505 | 0.842 | 100 %  |
-
-Mix baseline: PESQ ≈ 1.16, STOI ≈ 0.72.
+| | |
+|---|---|
+| **Current phase** | Reproducing `sepformer-libri2mix` on Libri2Mix test — target 20.6 dB SI-SDRi ± 0.5 |
+| **Evaluation harness** | Complete: LibriMix loader, SI-SDRi under optimal assignment, unknown-N scoring, committed per-run records |
+| **History** | The previous two-speaker male/female system (custom 301K-parameter DPCRN + gender-based attention, +6.9 dB SI-SDRi on a private synthetic set) is released as tag `v0.4.0` and no longer part of the codebase |
 
 ---
 
 ## Requirements
 
 - **Python 3.10+**
-- **OS:** Linux, macOS, or Windows
-- **GPU:** optional — required for training; inference runs on CPU / Apple MPS
-
-### Main Python dependencies
+- **GPU:** required for fine-tuning; inference and evaluation run on CPU
+- Pretrained checkpoints are downloaded from Hugging Face on first use
 
 | Library | Purpose |
 |---|---|
-| `numpy`, `scipy` | Numerical operations, DSP |
-| `librosa`, `soundfile` | Audio I/O and feature extraction |
-| `scikit-learn` | MLP, GMM, StandardScaler |
-| `torch>=2.0` | DPCRNSeparator training and inference |
-| `speechbrain>=1.1` | Pretrained separation backbones (N-speaker research track) |
-| `matplotlib` | Spectrograms and diagnostics |
+| `numpy`, `scipy` | Numerical operations, metrics |
+| `librosa`, `soundfile` | Audio I/O and resampling |
+| `speechbrain>=1.1` | Pretrained separation backbones |
+| `torch`, `torchaudio` | Inference and fine-tuning |
+| `matplotlib` | Diagnostics and result curves |
 | `pytest` | Unit testing |
+
+`pesq` and `pystoi` are optional: the metrics degrade gracefully to SI-SDR alone
+when they are not installed.
 
 ---
 
@@ -114,73 +103,10 @@ python scripts/check_separation_env.py
 > **Apple Silicon:** SpeechBrain 1.1.0 inference runs on CPU, not MPS — its
 > `Pretrained` base class only assigns a device type for `cpu` and `cuda`.
 
-> **Dataset:** download LibriSpeech `dev-clean` from [openslr.org/12](https://www.openslr.org/12/) and place it under `data/raw/librispeech/dev-clean/`.
-
----
-
-## Usage
-
-### Quick demo
-
-```bash
-python demo.py
-```
-
-Generates a M+F mixture from LibriSpeech, runs the pipeline, and saves five files to `data/processed/demo/`.
-
-### Train the models
-
-```bash
-# Stage 1a — MLP classifier (IBM multi-SNR labels, ~10-20 min):
-python -m src.ai.train --out models/classifier.joblib
-
-# Stage 1b — GenderGMM on clean LibriSpeech (~1 min):
-python -m src.ai.train_gmm --out models/gender_gmm.joblib
-
-# Stage 2 — DPCRNSeparator, uPIT (standalone, GPU recommended, ~2-4 h):
-python -m src.ai.train_separator \
-    --n-samples 200 --epochs 60 --batch-size 4 \
-    --out models/separator.pt
-```
-
-#### Robustness training (reverberant audio)
-
-```bash
-python -m src.ai.train_separator \
-    --n-samples 200 --epochs 60 --batch-size 4 \
-    --rir-dir data/raw/rir --rir-prob 0.5 \
-    --out models/separator_robust.pt
-```
-
-> **RIR datasets:** [MIT Acoustical Reverberation](https://mcdermottlab.mit.edu/Reverb/IR_Survey.html),
-> [OpenSLR28](https://www.openslr.org/28/), [BUT ReverbDB](https://speech.fit.vutbr.cz/software/but-speech-fit-reverb-database).
-
-### End-to-end pipeline
-
-```bash
-# Recommended (classifier stream selection):
-python -m src.pipeline \
-    --input mix.wav \
-    --model models/classifier.joblib \
-    --gmm   models/gender_gmm.joblib \
-    --separator models/separator.pt \
-    --target female \
-    --output out.wav
-
-# Language-agnostic (pitch-based, no trained model needed):
-python -m src.pipeline \
-    --input mix.wav \
-    --separator models/separator.pt \
-    --target male \
-    --stream-select pitch \
-    --vad-gate \
-    --output out.wav
-```
-
 ### Run tests
 
 ```bash
-pytest tests/
+pytest tests/ -q
 ```
 
 ---
@@ -244,69 +170,43 @@ off-by-one or catastrophic.
 
 ---
 
+---
+
 ## Project Structure
 
 ```
 auralis/
 ├── README.md
-├── ROADMAP.md
-├── requirements.txt
-├── demo.py                    # Quick demo script
+├── ROADMAP.md                 # Phase plan and decision record
+├── EXPERIMENTS.md             # Running log of every evaluated run
+│
+├── docs/research/
+│   ├── unknown-n-state-of-the-art.md   # Literature review, candidate directions
+│   └── reproduction-targets.md         # Pinned targets and evaluation protocol
 │
 ├── src/
-│   ├── dsp/
-│   │   ├── stft.py            # STFT / ISTFT (centralised parameters)
-│   │   ├── features.py        # 56-feature extraction per frame (MFCC, pitch, LPC, ...)
-│   │   ├── dataset.py         # LibriSpeech loader, M+F mixer, IBM dataset builder
-│   │   ├── augment.py         # RIR reverb augmentation (synthetic-to-real robustness)
-│   │   └── enhancement.py     # Voice activity gate
-│   │
-│   ├── ai/
-│   │   ├── classifier.py      # SpeakerClassifier (MLP + StandardScaler)
-│   │   ├── gmm_classifier.py  # GenderGMM: LLR = log P(X|GMM_F) - log P(X|GMM_M)
-│   │   ├── attention.py       # AttentionModule: score_female() + select_stream()
-│   │   ├── dpcrn.py           # DPCRNSeparator — primary separator (~301K params, uPIT)
-│   │   ├── train.py           # MLP classifier training script
-│   │   ├── train_gmm.py       # GenderGMM training script
-│   │   └── train_separator.py # DPCRNSeparator training script (uPIT, dynamic mixing)
-│   │
 │   ├── data/
-│   │   └── librimix.py        # LibriMix benchmark loader (metadata or generated tree)
+│   │   └── librimix.py        # LibriMix loader (metadata CSVs or generated tree)
 │   │
 │   ├── eval/
-│   │   ├── metrics.py         # SI-SDR, optimal assignment, PESQ / STOI (pure numpy)
-│   │   ├── harness.py         # Evaluation protocol over a dataset
+│   │   ├── metrics.py         # SI-SDR, optimal assignment, PESQ / STOI
+│   │   ├── harness.py         # The evaluation protocol
 │   │   └── registry.py        # results/<id>.json + EXPERIMENTS.md row
 │   │
-│   ├── pipeline.py            # End-to-end CLI
+│   ├── dsp/
+│   │   ├── stft.py            # STFT / ISTFT with centralised parameters
+│   │   ├── augment.py         # RIR reverb augmentation (for the robustness sweep)
+│   │   └── enhancement.py     # Voice activity gate (stop-criterion candidate)
+│   │
 │   └── utils.py               # Audio I/O utilities
 │
-├── data/
-│   ├── raw/librispeech/       # LibriSpeech dev-clean (not tracked by git)
-│   ├── raw/rir/               # Room Impulse Responses for reverb augmentation (optional)
-│   └── processed/demo/        # Demo output files
-│
-├── models/                    # Trained models (not tracked by git)
-│   │                          # classifier.joblib, gender_gmm.joblib, separator.pt
-├── notebooks/
-│   ├── 02_evaluation.ipynb    # Quantitative metrics: SI-SDR, PESQ, STOI
-│   └── 03_diagnosis.ipynb     # Classifier vs masking stage diagnosis
-├── docs/research/             # State-of-the-art review, reproduction targets
-├── results/                   # Committed evaluation records (one JSON per run)
-├── EXPERIMENTS.md             # Running log of every evaluated experiment
-│
 ├── scripts/
-│   ├── evaluate.py            # Benchmark CLI (LibriMix + experiment registry)
-│   ├── check_separation_env.py # Environment validation for the separation stack
-│   └── evaluate_separator.py  # Legacy gender-target evaluation
+│   ├── evaluate.py            # Benchmark CLI
+│   └── check_separation_env.py # Environment validation
+│
+├── results/                   # Committed evaluation records, one JSON per run
+├── data/raw/                  # LibriSpeech, LibriMix, RIRs (not tracked)
 └── tests/
-    ├── test_utils.py
-    ├── test_features.py
-    ├── test_augment.py
-    ├── test_pipeline.py
-    ├── test_metrics.py
-    ├── test_librimix.py
-    └── test_harness.py
 ```
 
 ---
@@ -315,9 +215,15 @@ auralis/
 
 - **Cherry, E. C.** (1953). *Some Experiments on the Recognition of Speech, with One and with Two Ears.* JASA, 25(5). — Original definition of the cocktail party problem.
 - **Bregman, A. S.** (1990). *Auditory Scene Analysis.* MIT Press. — Bottom-up / top-down model of auditory attention.
-- **Kolbæk, M. et al.** (2017). *Multitalker Speech Separation with Utterance-Level Permutation Invariant Training.* IEEE/ACM TASLP. — uPIT training used for the DPCRNSeparator.
-- **Le, X. et al.** (2022). *DPCRN: Dual-Path Convolution Recurrent Network for Single Channel Speech Enhancement.* ICASSP. — Architectural inspiration for the separator.
 - **Wang, D., & Brown, G. J.** (2006). *Computational Auditory Scene Analysis.* Wiley-IEEE Press.
+- **Kolbæk, M. et al.** (2017). *Multitalker Speech Separation with Utterance-Level Permutation Invariant Training.* IEEE/ACM TASLP. — uPIT, the training criterion underlying the known-N systems.
+- **Takahashi, N. et al.** (2019). *Recursive Speech Separation for Unknown Number of Speakers.* Interspeech. — OR-PIT; one-and-rest extraction, the baseline for the recursive approach.
+- **Chetupalli, S. R., & Habets, E.** (2022). *Speech Separation for an Unknown Number of Speakers Using Transformers With Encoder-Decoder Attractors.* Interspeech. — SepEDA.
+- **Lee, D. et al.** (2024). *Boosting Unknown-number Speaker Separation with Transformer Decoder-based Attractor.* — SepTDA, current quality leader.
+- **Yang, et al.** (2025). *Speaker Separation for an Unknown Number of Speakers with Encoder-Decoder-Based Contextual Information Module.* Interspeech. — SepNetEDCI; source of the comparison table in the review.
+
+A fuller bibliography, with the numbers each paper reports, is in
+[`docs/research/unknown-n-state-of-the-art.md`](docs/research/unknown-n-state-of-the-art.md).
 
 ---
 
