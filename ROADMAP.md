@@ -15,6 +15,12 @@
 > conventions, per-run records in `results/` and `EXPERIMENTS.md`, CI on every push. Licence: MIT.
 > See "Legacy removal" and "Evaluation infrastructure" below.
 >
+> **Phase 4 is G1** (decided 2026-08-10): a reproducible robustness benchmark for unknown-N
+> speaker counting — overlap × RT60 × N, each cell scored with N given and N estimated. Design in
+> [`docs/research/g1-benchmark-design.md`](docs/research/g1-benchmark-design.md). Done so far:
+> unknown-N scoring with an explicit floor (G1.1) and calibrated simulated reverberation (G1.3,
+> generator only).
+>
 > **Next action:** Phase 1 — generate Libri2Mix test (8 kHz, `min`), run the control
 > (`--separator none`, must read ~0 dB), then reproduce `sepformer-libri2mix` at 20.6 dB ± 0.5.
 > The SpeechBrain adapter in `scripts/evaluate.py` has never been executed: if the number misses
@@ -428,10 +434,10 @@ measurement apparatus is trustworthy first, so the harness was built before atte
 | File | Purpose |
 |---|---|
 | `src/data/librimix.py` | LibriMix loader — mixes on the fly from the official metadata CSVs (`source_<i>_path` / `source_<i>_gain`, min/max modes, polyphase resampling) or reads a generated tree |
-| `src/eval/metrics.py` | SI-SDR, optimal rectangular estimate-to-reference assignment, optional PESQ/STOI |
+| `src/eval/metrics.py` | SI-SDR, optimal estimate-to-reference assignment with unknown-N count-error handling, optional PESQ/STOI |
 | `src/eval/harness.py` | The protocol itself: SI-SDRi over the unprocessed mixture, per-item records, speaker-count accuracy and `N->N̂` confusion |
 | `src/eval/registry.py` | `results/<id>.json` + an `EXPERIMENTS.md` row per run |
-| `scripts/evaluate.py` | Benchmark CLI: pretrained SpeechBrain checkpoints, the legacy DPCRN, or `none` for the control run |
+| `scripts/evaluate.py` | Benchmark CLI: pretrained SpeechBrain checkpoints, or `none` for the control run |
 | `.github/workflows/tests.yml` | CI on every push, Python 3.10 and 3.13, core dependencies only |
 | `LICENSE` | MIT — without it the code was legally all-rights-reserved and could not be cited |
 
@@ -440,8 +446,13 @@ measurement apparatus is trustworthy first, so the harness was built before atte
 - Optimal assignment at evaluation time, never a fixed output order.
 - Over-estimation (N̂ > N) scores the best-matching subset of estimates.
 - **Under-estimation (N̂ < N) substitutes silence** for each unmatched reference — skipping
-  it would quietly reward a model for emitting too few sources. Silence carries error energy
-  equal to the reference, hence 0 dB SI-SDR and no improvement over the mixture.
+  it would quietly reward a model for emitting too few sources. Silence scores −∞, clipped at
+  an explicit floor (`floor_db`, default −30 dB) that is stored with every result. An earlier
+  version let epsilons score silence at 0 dB, which made a missed speaker a *gain* whenever the
+  mixture sits below 0 dB — i.e. at every N ≥ 3. Exact reconstruction is capped at +100 dB so
+  aggregates stay finite.
+- SI-SDRi is also reported over correctly counted mixtures only, to read separation quality
+  apart from counting failures.
 - Speaker-count accuracy reported separately, with the `N->N̂` breakdown.
 - No peak-normalisation or trimming of estimates before scoring.
 
@@ -460,7 +471,7 @@ measurement apparatus is trustworthy first, so the harness was built before atte
 4. Release on a measured improvement, never on "code was written". Keep `pyproject.toml` in sync with the tag.
 5. Run the control before trusting any number.
 
-**Status:** ✅ Code complete, 69/69 tests passing. Control run verified at 8 kHz and 16 kHz
+**Status:** ✅ Code complete, tests passing. Control run verified at 8 kHz and 16 kHz
 (exactly 0.0 dB SI-SDRi). ⏳ The SpeechBrain adapter could not be executed in the environment
 where it was written (no torch/speechbrain there) — the Phase 1 reproduction run is its first
 real exercise; if the output tensor layout differs from `(batch, time, n_src)`, that adapter is
@@ -804,7 +815,7 @@ The framing question is **not "can we separate?"** but **"can we separate when N
 - **Phase 1 — Reproducible baseline.** Install SpeechBrain (v1.1.0+), generate Libri2Mix, load pretrained `sepformer-libri2mix`, and **reproduce the published SI-SDRi (~20.6 dB, ±0.5 dB)**. Establishes trustworthy pipeline + metrics before any innovation.
 - **Phase 2 — 3-speaker stepping stone.** Use pretrained `sepformer-wsj03mix` to validate metrics/infra on N=3 without training anything.
 - **Phase 3 — Recursive N-way extraction (baseline contribution).** Implement OR-PIT one-and-rest extraction with VAD stop; fine-tune a pretrained backbone (lightweight candidate: `resepformer`). Evaluate **speaker-counting accuracy** and **separation quality** jointly on N=2,3,(4).
-- **Phase 4 — ⚠️ being re-scoped (see below).** Originally: single-pass attractor/EDA count-and-separate as the main contribution.
+- **Phase 4 — G1 robustness benchmark (decided 2026-08-10).** Replaces the original single-pass attractor/EDA plan; see the re-scoping below and [`docs/research/g1-benchmark-design.md`](docs/research/g1-benchmark-design.md).
 
 ### Phase 4 re-scoping (2026-08-09 literature review)
 
@@ -815,7 +826,7 @@ What remains open, per the review:
 1. **Quality vs. termination robustness.** SepTDA leads separation by 2–6 dB but its counting drops to 90.1% (N=4) and 83.2% (N=5); SepNetEDCI trades that quality margin for 95.7% counting at N=5. Nobody has both.
 2. **No shared benchmark for realistic conditions.** Every published number above is anechoic, 100%-overlapped, single-utterance, 8 kHz simulated audio. The one work targeting reverberant multi-utterance mixtures (A-DCSS, 2025) reports 9.7 dB ΔSI-SDR on data it synthesized itself — roughly half the anechoic figure, and not comparable to anyone else's.
 
-Three candidate directions are documented with feasibility notes against the RTX 5070 ceiling: **G1** a reproducible robustness benchmark for unknown-N counting (overlap ratio × RT60 × noise × N, reusing `src/dsp/augment.py`), **G2** termination-criterion robustness for recursive extraction, **G3** closing the quality/counting trade-off. **Recommendation: G1, then G2.** *Pending explicit decision — Phase 4 stays open until then.* Phases 0–3 are unaffected.
+Three candidate directions are documented with feasibility notes against the RTX 5070 ceiling: **G1** a reproducible robustness benchmark for unknown-N counting (overlap ratio × RT60 × noise × N, reusing `src/dsp/augment.py`), **G2** termination-criterion robustness for recursive extraction, **G3** closing the quality/counting trade-off. **Decision (2026-08-10): G1, with G2 as the follow-on.** Phases 0–3 are unaffected; G1 consumes them (reproduction = G1.2, recursive extractor = G1.4).
 
 Reproduction targets and the evaluation protocol for Phases 1–2 are pinned in [`docs/research/reproduction-targets.md`](docs/research/reproduction-targets.md).
 
