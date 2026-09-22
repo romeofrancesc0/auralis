@@ -5,6 +5,20 @@
 > **2026-07-01 — Project reframed + single priority set.** Auralis is no longer scoped as a single-course academic exercise (binary M/F separation). It is now a **research project**: given a mixture of **N unknown, simultaneous speakers**, produce **N separated output audio streams**, one per speaker, with no fixed assumption on gender or speaker count. **The only active priority is the N-speaker extension** (see "Final Objective — N-Speaker Cocktail Party" below, promoted from "future phase" to the active roadmap). Every other previously-listed next step (RIR real-audio validation of `separator_robust.pt`, WSJ0-mix/LibriMix benchmarking, academic paper writeup) is **deprioritized and paused** — kept in this document as historical/design record only, not as pending work. They may be revisited opportunistically if they end up serving the N-speaker goal (e.g. LibriMix is itself an N-speaker dataset), but they are not scheduled.
 >
 > **2026-07-11 — Research direction locked: SpeechBrain + recursive unknown-N.** The "lightweight ML" constraint is dropped; the project now pursues SOTA architectures under a disciplined research method. Key insight: fixed-and-known-N separation is essentially solved (TF-GridNet ~23 dB SI-SDRi on WSJ0-2mix); the open problem is **unknown N** — counting speakers while separating. Decisions: **(1) Framework = SpeechBrain** (v1.1.0, Mar 2026, actively maintained, `torch>=2.1` uncapped) rather than Asteroid (last release Oct 2023, stale, hostile `torchmetrics==1.8.0` pin). SpeechBrain ships LibriMix/WSJ0-mix recipes and pretrained SepFormer/ReSepFormer checkpoints (`sepformer-libri2mix` 20.6 dB, `sepformer-wsj02mix` 22.4, `sepformer-wsj03mix` 19.8 — **3-speaker available out-of-the-box**, `resepformer-wsj02mix` 18.6 — resource-efficient). **(2) Benchmark = LibriMix/WSJ0-mix** with reproducible SI-SDRi; reproduce a published baseline before innovating. **(3) Unknown-N approach = recursive one-and-rest extraction (OR-PIT)** as the baseline, **attractor/EDA-style** counting as the main contribution (Phase 2). **(4) Hardware:** RTX 5070 (12 GB, Blackwell sm_120) is the training ceiling — needs WSL2 + PyTorch nightly cu128 (stable wheels don't support sm_120 yet as of Jul 2026); MacBook Pro M5 is dev/eval only (MPS). Strategy fits the 12 GB ceiling via **fine-tuning pretrained backbones**, not training SOTA from scratch. Phased plan below in the "Final Objective" section.
+>
+> **2026-09-22 — Legacy track removed, evaluation harness in place.** The v0.4.0 male/female
+> system is no longer in the codebase (removed in full, recoverable from tag `v0.4.0`): the
+> repository now holds only the unknown-N research track. What remains of the old work are
+> `src/dsp/augment.py` (RIR) and the voice activity gate, kept because the state-of-the-art
+> review earmarks them for G1/G2. A benchmark harness now implements the protocol pinned in
+> `docs/research/reproduction-targets.md` — SI-SDRi under optimal assignment, unknown-N scoring
+> conventions, per-run records in `results/` and `EXPERIMENTS.md`, CI on every push. Licence: MIT.
+> See "Legacy removal" and "Evaluation infrastructure" below.
+>
+> **Next action:** Phase 1 — generate Libri2Mix test (8 kHz, `min`), run the control
+> (`--separator none`, must read ~0 dB), then reproduce `sepformer-libri2mix` at 20.6 dB ± 0.5.
+> The SpeechBrain adapter in `scripts/evaluate.py` has never been executed: if the number misses
+> the tolerance, check the output tensor layout there before suspecting the model.
 > **Last updated:** 2026-09-22.
 
 This document tracks the full implementation plan. It must be consulted and updated at the start of each phase. Decisions taken move from the "Open questions" section into the body of the document.
