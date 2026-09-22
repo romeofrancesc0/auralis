@@ -5,7 +5,7 @@
 > **2026-07-01 — Project reframed + single priority set.** Auralis is no longer scoped as a single-course academic exercise (binary M/F separation). It is now a **research project**: given a mixture of **N unknown, simultaneous speakers**, produce **N separated output audio streams**, one per speaker, with no fixed assumption on gender or speaker count. **The only active priority is the N-speaker extension** (see "Final Objective — N-Speaker Cocktail Party" below, promoted from "future phase" to the active roadmap). Every other previously-listed next step (RIR real-audio validation of `separator_robust.pt`, WSJ0-mix/LibriMix benchmarking, academic paper writeup) is **deprioritized and paused** — kept in this document as historical/design record only, not as pending work. They may be revisited opportunistically if they end up serving the N-speaker goal (e.g. LibriMix is itself an N-speaker dataset), but they are not scheduled.
 >
 > **2026-07-11 — Research direction locked: SpeechBrain + recursive unknown-N.** The "lightweight ML" constraint is dropped; the project now pursues SOTA architectures under a disciplined research method. Key insight: fixed-and-known-N separation is essentially solved (TF-GridNet ~23 dB SI-SDRi on WSJ0-2mix); the open problem is **unknown N** — counting speakers while separating. Decisions: **(1) Framework = SpeechBrain** (v1.1.0, Mar 2026, actively maintained, `torch>=2.1` uncapped) rather than Asteroid (last release Oct 2023, stale, hostile `torchmetrics==1.8.0` pin). SpeechBrain ships LibriMix/WSJ0-mix recipes and pretrained SepFormer/ReSepFormer checkpoints (`sepformer-libri2mix` 20.6 dB, `sepformer-wsj02mix` 22.4, `sepformer-wsj03mix` 19.8 — **3-speaker available out-of-the-box**, `resepformer-wsj02mix` 18.6 — resource-efficient). **(2) Benchmark = LibriMix/WSJ0-mix** with reproducible SI-SDRi; reproduce a published baseline before innovating. **(3) Unknown-N approach = recursive one-and-rest extraction (OR-PIT)** as the baseline, **attractor/EDA-style** counting as the main contribution (Phase 2). **(4) Hardware:** RTX 5070 (12 GB, Blackwell sm_120) is the training ceiling — needs WSL2 + PyTorch nightly cu128 (stable wheels don't support sm_120 yet as of Jul 2026); MacBook Pro M5 is dev/eval only (MPS). Strategy fits the 12 GB ceiling via **fine-tuning pretrained backbones**, not training SOTA from scratch. Phased plan below in the "Final Objective" section.
-> **Last updated:** 2026-07-11.
+> **Last updated:** 2026-09-22.
 
 This document tracks the full implementation plan. It must be consulted and updated at the start of each phase. Decisions taken move from the "Open questions" section into the body of the document.
 
@@ -170,8 +170,8 @@ Phases 1 and 2 can proceed in parallel after Phase 0. Phase 3 requires both.
 | 1 | ✅ Done | `src/dsp/stft.py` + `src/dsp/features.py` (56 features: MFCC+Δ+ΔΔ+pitch+rms+centroid+rolloff+ZCR+LPC) + `tests/test_features.py` |
 | 2 | ✅ Done | `src/dsp/dataset.py` — SPEAKERS.TXT parsing, M+F mix, multi-SNR IBM dataset |
 | 3 | ✅ Done | `src/ai/classifier.py`, `train.py`, `attention.py` — CV on 400 samples × 3 SNR values |
-| 4 | ✅ Done | `src/dsp/nmf_separation.py` (primary module) + `separation.py` (utilities/fallback) |
-| 5 | ✅ Done | `src/dsp/enhancement.py` — log-MMSE (Ephraim & Malah 1985) + minimum-statistics + peak normalisation |
+| 4 | ✅ Done | Originally `src/dsp/nmf_separation.py` + `separation.py`. **Superseded 2026-06-27** — both deleted; separation is now `src/ai/dpcrn.py` (DPCRNSeparator, uPIT) |
+| 5 | ✅ Done | `src/dsp/enhancement.py` — originally log-MMSE (Ephraim & Malah 1985) + minimum-statistics. **Superseded 2026-06-27** — the module now holds the VAD gate + peak normalisation |
 | 6 | ✅ Done | `src/pipeline.py` + `demo.py` + `tests/test_pipeline.py` (6 tests) + `notebooks/02_evaluation.ipynb` (SI-SDR, PESQ, STOI) |
 
 > Legend: ⬜ Not started · 🟡 In progress · ✅ Done · 🔴 Active bug
@@ -301,7 +301,7 @@ All models retrained with new loss and architecture:
 - Script di ricerca spostati in `scripts/`
 - `demo.py` aggiornato con pipeline completo (DPCRN con fallback su MaskNet)
 - `smoothing_gru.py` e `train_smoothing.py` rimossi: GRUSmoother addestrato ma senza miglioramento rispetto all'HMM — rimosso per mantenere il codebase pulito e rappresentativo della pipeline effettiva
-- Riferimenti rimossi da `attention.py`, `pipeline.py`, `CLAUDE.md`
+- Riferimenti rimossi da `attention.py`, `pipeline.py`
 
 **Extended evaluation — 36 samples, SNR in {-3, 0, +3} dB, seed=123 (MLP + GMM + HMM + DPCRN):**
 
@@ -371,6 +371,59 @@ Remaining gap due to DPCRN trained on old distribution — requires retraining w
 
 ---
 
+## Evaluation infrastructure (2026-09-22)
+
+Phase 1 asks for a reproduction of a published number. That is only meaningful if the
+measurement apparatus is trustworthy first, so the harness was built before attempting it.
+
+| File | Purpose |
+|---|---|
+| `src/data/librimix.py` | LibriMix loader — mixes on the fly from the official metadata CSVs (`source_<i>_path` / `source_<i>_gain`, min/max modes, polyphase resampling) or reads a generated tree |
+| `src/eval/metrics.py` | SI-SDR, optimal rectangular estimate-to-reference assignment, optional PESQ/STOI |
+| `src/eval/harness.py` | The protocol itself: SI-SDRi over the unprocessed mixture, per-item records, speaker-count accuracy and `N->N̂` confusion |
+| `src/eval/registry.py` | `results/<id>.json` + an `EXPERIMENTS.md` row per run |
+| `scripts/evaluate.py` | Benchmark CLI: pretrained SpeechBrain checkpoints, the legacy DPCRN, or `none` for the control run |
+| `.github/workflows/tests.yml` | CI on every push, Python 3.10 and 3.13, core dependencies only |
+| `LICENSE` | MIT — without it the code was legally all-rights-reserved and could not be cited |
+
+**Conventions implemented, per `docs/research/reproduction-targets.md`:**
+- SI-SDR **improvement** over the mixture, never bare SI-SDR.
+- Optimal assignment at evaluation time, never a fixed output order.
+- Over-estimation (N̂ > N) scores the best-matching subset of estimates.
+- **Under-estimation (N̂ < N) substitutes silence** for each unmatched reference — skipping
+  it would quietly reward a model for emitting too few sources. Silence carries error energy
+  equal to the reference, hence 0 dB SI-SDR and no improvement over the mixture.
+- Speaker-count accuracy reported separately, with the `N->N̂` breakdown.
+- No peak-normalisation or trimming of estimates before scoring.
+
+**Design decisions:**
+- **Torch-free evaluation.** Metrics and harness are pure numpy; the separator enters as a
+  plain callable `(mixture, sr) -> list[np.ndarray]`. SpeechBrain, the legacy DPCRN and a
+  future recursive extractor all plug in without touching evaluation code — which is what
+  makes Phase 3's unknown-N work measurable with the same harness as Phase 1.
+- **Control run built in.** `--separator none` must read 0 dB SI-SDRi. Verified end to end.
+- **Results are committed.** `results/*.json` and the log row are research output, not scratch.
+
+**Working rules for the research phases:**
+1. One variable per experiment — otherwise a gain cannot be attributed.
+2. Always report on the frozen split, never on a set tuned along the way.
+3. `main` stays green; one `exp/<name>` branch per experiment, merged only if the number improves.
+4. Release on a measured improvement, never on "code was written". Keep `pyproject.toml` in sync with the tag.
+5. Run the control before trusting any number.
+
+**Status:** ✅ Code complete, 69/69 tests passing. Control run verified at 8 kHz and 16 kHz
+(exactly 0.0 dB SI-SDRi). ⏳ The SpeechBrain adapter could not be executed in the environment
+where it was written (no torch/speechbrain there) — the Phase 1 reproduction run is its first
+real exercise; if the output tensor layout differs from `(batch, time, n_src)`, that adapter is
+the place to look.
+
+**Environment note:** remote/automated sessions currently have read-only GitHub access to this
+repository — they can clone and read, but pushes return 403. Work produced there arrives as a
+`git format-patch` bundle to apply locally with `git am`. Credentials are minted when a session
+starts, so re-authorising mid-session has no effect.
+
+---
+
 ## Session 2026-06-14 — RIR reverb augmentation (synthetic-to-real robustness)
 
 **Motivation:** the separator is trained on anechoic LibriSpeech mixtures, so it
@@ -396,9 +449,9 @@ real data — clean voices are convolved with measured/simulated RIRs before mix
 | `src/dsp/augment.py` | New — `load_rir_index`, `split_rirs`, `load_rir` (cached), `apply_rir`, `reverberate_pair` |
 | `src/ai/train_separator.py` | `--rir-dir` / `--rir-prob` args; reverb applied in dynamic dataset + val; dual clean/reverb validation + combined checkpoint |
 | `tests/test_augment.py` | New — 8 tests (length preservation, identity impulse, additivity invariant, missing/empty index, deterministic split) |
-| `CLAUDE.md`, `README.md` | Documented module, command, RIR dataset download |
+| `README.md` | Documented module, command, RIR dataset download |
 
-**Status:** ✅ Code complete, 41/41 tests passing. ⏸ **Paused (2026-07-01):** real-audio
+**Status:** ✅ Code complete, 39/39 tests passing. ⏸ **Paused (2026-07-01):** real-audio
 validation (download an RIR set into `data/raw/rir/`, train `separator_robust.pt` on the
 GPU desktop, evaluate on real audio, confirm perceptually before tagging) is no longer
 scheduled work — the project's only active priority is the N-speaker extension (see status
